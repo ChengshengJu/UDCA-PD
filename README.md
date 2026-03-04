@@ -12,7 +12,7 @@ Contents The repository includes the following SAS scripts: Analysis_combined.sa
 
 Required Data The analyses were conducted using data from CPRD Aurum and GOLD To replicate the results, access to this dataset is required.
 
-Data inputs expected: Patient-level data with demographics, UDCA prescription records, covariates, and outcome events from CPRD Gold and Aurum within each individual emulated trials
+Data inputs expected: Patient-level data with demographics, UDCA prescription records, covariates, and outcome events from CPRD Gold and Aurum within each individual emulated trials.
 
 Please note: Due to data governance restrictions, the dataset itself is not shared.
 
