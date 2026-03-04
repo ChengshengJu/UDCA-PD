@@ -1,4 +1,23 @@
 /*ANALYTICAL CODES - DESCRIPTIVE STATISTICS, PS MATCHING, POOLED LOGSITIC REGRESSION ANALYSIS, SECONDARY AND SENSIVITIY ANALYSIS*/
+
+%macro combine;
+%let min=1;
+%let max=160;
+%do i=&min %to &max;
+
+data udca.patient_cov_tr&i.;
+set udca_g.patient_cov_tr&i. udca_a.patient_cov_tr&i.;
+run;
+
+%end;
+%mend;
+
+%combine;
+
+data UDCA.patient_tr_all;
+set UDCA.patient_cov_tr1-UDCA.patient_cov_tr160;
+run;
+
 %macro describe_trials_mtch;
 %do i = 1 %to 160;
 
