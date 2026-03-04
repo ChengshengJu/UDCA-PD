@@ -1,0 +1,2255 @@
+/*ANALYTICAL CODES - DESCRIPTIVE STATISTICS, PS MATCHING, POOLED LOGSITIC REGRESSION ANALYSIS, SECONDARY AND SENSIVITIY ANALYSIS*/
+%macro describe_trials_mtch;
+%do i = 1 %to 160;
+
+proc sql;
+    create table udca.Count_uniq_&i. as
+    select catx('_', 'group', exp) as Group, 
+           count(distinct patid) as UniqueIDCount,
+           sum(o_parkin) as NumParkin,  /* Count non-missing values of o_parkin */
+           mean(fu_parkin)/365.25 as AvgFuPark     /* Calculate average of fu_park */
+    from udca.patient_cov_tr&i.
+    group by exp;
+quit;
+%end;
+%mend;
+%describe_trials_mtch;
+
+%macro merge_mtch;
+data udca.All_Counts;
+    length Table_Number $5;
+    retain Table_Number;
+    %do i = 1 %to 160;
+        set udca.Count_uniq_&i. (in=a);
+        if a then Table_Number = &i.;
+        output;
+    %end;
+run;
+%mend;
+%merge_mtch;
+
+proc sort data=udca.All_Counts;
+	by Table_Number;
+run;
+
+proc sql;
+    create table UDCA.Count_all as
+    select catx('_', 'group', exp) as Group, 
+           count(patid) as IDCount,
+           sum(o_parkin) as NumParkin,  /* Count non-missing values of o_parkin */
+           mean(fu_parkin)/365.25 as AvgFuPark     /* Calculate average of fu_park */
+    from UDCA.patient_tr_all
+    group by exp;
+quit;
+
+proc sql;
+    create table UDCA.Count_tr_uniq as
+    select catx('_', 'group', exp) as Group, 
+           count(distinct patid) as UniqueIDCount 
+    from UDCA.patient_tr_all
+    group by exp
+    union all
+    select 'Total' as Group, 
+           count(distinct patid) as UniqueIDCount 
+    from UDCA.patient_tr_all;
+quit;
+
+/*ps-matching macro*/
+%MACRO MATCH(CASE=,CONTROL=,IDCA=,IDCO=,MVARS=,WTS=,DMAXK=,DMAX=,
+             NCONTLS=, TIME=,
+             METHOD=,SEEDCA=,SEEDCO=,MAXITER=100000,PRINT=y,
+             OUT=__OUT,OUTNMCA=__NMCA,OUTNMCO=__NMCO,MINCONT=,MAXCONT=);
+
+   %LET BAD=0;
+   %IF %LENGTH(&CASE)=0 %THEN %DO;
+      %PUT ERROR: NO CASE DATASET SUPPLIED;
+      %LET BAD=1;
+   %END;
+   %IF %LENGTH(&CONTROL)=0 %THEN %DO;
+      %PUT ERROR: NO CONTROL DATASET SUPPLIED;
+      %LET BAD=1;
+   %END;
+   %IF %LENGTH(&IDCA)=0 %THEN %DO;
+      %PUT ERROR: NO IDCA VARIABLE SUPPLIED;
+      %LET BAD=1;
+   %END;
+   %IF %LENGTH(&IDCO)=0 %THEN %DO;
+      %PUT ERROR: NO IDCO VARIABLE SUPPLIED;
+      %LET BAD=1;
+   %END;
+   %IF %LENGTH(&MVARS)=0 %THEN %DO;
+      %PUT ERROR: NO MATCHING VARIABLES SUPPLIED;
+      %LET BAD=1;
+   %END;
+   %IF %LENGTH(&WTS)=0 %THEN %DO;
+      %PUT ERROR: NO WEIGHTS SUPPLIED;
+      %LET BAD=1;
+   %END;
+   %IF %UPCASE(&METHOD)=GREEDY %THEN %DO;
+      %IF %LENGTH(&SEEDCA)=0 %THEN %DO;
+         %PUT ERROR: NO SEEDCA VALUE SUPPLIED;
+         %LET BAD=1;
+      %END;
+      %IF %LENGTH(&SEEDCO)=0 %THEN %DO;
+         %PUT ERROR: NO SEEDCO VALUE SUPPLIED;
+         %LET BAD=1;
+      %END;
+   %END;
+   %IF %LENGTH(&OUT)=0 %THEN %DO;
+      %PUT ERROR: NO OUTPUT DATASET SUPPLIED;
+      %LET BAD=1;
+   %END;
+   %IF %UPCASE(&METHOD)^=GREEDY & %UPCASE(&METHOD)^=OPTIMAL %THEN %DO;
+      %PUT ERROR: METHOD MUST BE GREEDY OR OPTIMAL;
+      %LET BAD=1;
+   %END;
+   %IF (&MINCONT=  AND &MAXCONT^= ) OR (&MINCONT^=  AND &MAXCONT= )
+   %THEN %DO;
+      %PUT ERROR: MINCONT AND MAXCONT MUST BOTH BE SPECIFIED;
+      %LET BAD=1;
+   %END;
+   %LET NVAR=0;
+   %DO %UNTIL(%SCAN(&MVARS,&NVAR+1,' ')= );
+      %LET NVAR=%EVAL(&NVAR+1);
+   %END;
+   %LET NWTS=0;
+   %DO %UNTIL(%QSCAN(&WTS,&NWTS+1,' ')= );
+      %LET NWTS=%EVAL(&NWTS+1);
+   %END;
+   %IF &NVAR^= &NWTS %THEN %DO;
+      %PUT ERROR: #VARS MUST EQUAL #WTS;
+      %LET BAD=1;
+   %END;
+   %LET NK=0;
+   %IF %QUOTE(&DMAXK)^=  %THEN %DO %UNTIL(%QSCAN(&DMAXK,&NK+1,' ')= );
+      %LET NK=%EVAL(&NK+1);
+   %END;
+   %IF &NK>&NVAR %THEN %LET NK=&NVAR;
+   %DO I=1 %TO &NVAR;
+      %LET V&I=%SCAN(&MVARS,&I,' ');
+   %END;
+   %IF &NWTS>0 %THEN %DO;
+        DATA _NULL_;
+        %DO I=1 %TO &NWTS;
+             %LET W&I=%SCAN(&WTS,&I,' ');
+             IF &&W&I<0 THEN DO;
+                  PUT 'ERROR: WEIGHTS MUST BE NON-NEGATIVE';
+                  CALL SYMPUT('BAD','1');
+             END;
+        %END;
+        RUN;
+   %END;
+   %IF &NK>0 %THEN %DO;
+        DATA _NULL_;
+        %DO I=1 %TO &NK;
+             %LET K&I=%SCAN(&DMAXK,&I,' ');
+             IF &&K&I<0 THEN DO;
+                  PUT 'ERROR: DMAXK VALUES MUST BE NON-NEGATIVE';
+                  CALL SYMPUT('BAD','1');
+             END;
+        %END;
+        RUN;
+   %END;
+   %MACRO DIJ;
+      %DO I=1 %TO &NVAR-1;
+         &&W&I*ABS(__CA&I-__CO&I) +
+      %END;
+      &&W&NVAR*ABS(__CA&NVAR-__CO&NVAR);
+   %MEND DIJ;
+   %MACRO MAX1;
+      %IF &DMAX^= %THEN %DO;
+         & __D<=&DMAX
+      %END;
+      %DO I=1 %TO &NK;
+         & ABS(__CA&I-__CO&I)<=&&K&I
+      %END;
+   %MEND MAX1;
+   %MACRO MAX2;
+      %IF &DMAX= & &NK=0 %THEN %DO;
+         %IF &time^= %then %do;
+            if __cotime>__catime then
+         %end;
+         output;
+      %end;
+      %IF &DMAX^= & &NK=0 %THEN %DO;
+         IF _COST_<=&DMAX
+         %if &time^= %then %do;
+            & __cotime>__catime
+         %end;
+         THEN OUTPUT;
+      %END;
+      %IF &DMAX= & &NK>0 %THEN %DO;
+         IF ABS(__CA1-__CO1)<=&K1
+         %DO I=2 %TO &NK;
+            & ABS(__CA&I-__CO&I)<=&&K&I
+         %END;
+         %if &time^= %then %do;
+            & __cotime>__catime
+         %end;
+         THEN OUTPUT;
+      %END;
+      %IF &DMAX^= & &NK>0 %THEN %DO;
+         IF _COST_<=&DMAX
+         %DO I=1 %TO &NK;
+            & ABS(__CA&I-__CO&I)<=&&K&I
+         %END;
+         %if &time^= %then %do;
+            & __cotime>__catime
+         %end;
+         THEN OUTPUT;
+      %END;
+   %MEND MAX2;
+   %MACRO LBLS;
+      %DO I=1 %TO &NVAR;
+         __CA&I="&&V&I/CASE"
+         __CO&I="&&V&I/CONTROL"
+         __DIF&I="&&V&I/ABS. DIFF "
+         __WT&I="&&V&I/WEIGHT"
+      %END;
+   %MEND LBLS;
+   %MACRO VBLES;
+      %DO I=1 %TO &NVAR;
+         __DIF&I
+      %END;
+      %DO I=1 %TO &NVAR;
+         __CA&I __CO&I
+      %END;
+   %MEND VBLES;
+   %MACRO GREEDY;
+    %GLOBAL BAD2;
+      DATA __CASE; SET &CASE;
+           %DO I=1 %TO &NVAR;
+                %LET MISSTEST=%SCAN(&MVARS,&I,' ');
+                IF &MISSTEST=. THEN DELETE;
+           %END;
+           %IF &TIME^= %THEN %DO;
+                IF &TIME=. THEN DELETE;
+           %END;
+      DATA __CASE; SET __CASE END=EOF;
+       KEEP __IDCA __CA1-__CA&NVAR __R &mvars
+       %if &time^= %then %do;
+             __catime
+          %end;
+          ;
+         __IDCA=&IDCA;
+         %if &time^= %then %do;
+            __catime=&time;
+         %end;
+         %DO I=1 %TO &NVAR;
+            __CA&I=&&V&I;
+         %END;
+         SEED=&SEEDCA;
+         __R=RANUNI( SEED  );
+         IF EOF THEN CALL SYMPUT('NCA',_N_);
+      PROC SORT; BY __R __IDCA;
+      DATA __CONT; SET &CONTROL;
+           %DO I=1 %TO &NVAR;
+                %LET MISSTEST=%SCAN(&MVARS,&I,' ');
+                IF &MISSTEST=. THEN DELETE;
+           %END;
+           %IF &TIME^= %THEN %DO;
+                IF &TIME=. THEN DELETE;
+           %END;
+      DATA __CONT; SET __CONT END=EOF;
+       KEEP __IDCO __CO1-__CO&NVAR __R &mvars
+        %if &time^= %then %do;
+           __cotime
+        %end;
+        ;
+         __IDCO=&IDCO;
+         %if &time^= %then %do;
+            __cotime=&time;
+         %end;
+         %DO I=1 %TO &NVAR;
+            __CO&I=&&V&I;
+         %END;
+         SEED=&SEEDCO;
+         __R=RANUNI( SEED  );
+         IF EOF THEN CALL SYMPUT('NCO',_N_);
+      RUN;
+      %LET BAD2=0;
+      %IF &NCO < %EVAL(&NCA*&NCONTLS) %THEN %DO;
+         %PUT ERROR: NOT ENOUGH CONTROLS TO MAKE REQUESTED MATCHES;
+         %LET BAD2=1;
+      %END;
+      %IF &BAD2=0 %THEN %DO;
+         PROC SORT; BY __R __IDCO;
+         DATA __MATCH;
+          KEEP __IDCA __CA1-__CA&NVAR __DIJ __MATCH __CONT_N
+          %if &time^= %then %do;
+             __catime __cotime
+          %end;
+          ;
+          ARRAY __USED(&NCO) $ 1 _TEMPORARY_;
+            DO __I=1 TO &NCO;
+               __USED(__I)='0';
+            END;
+            DO __I=1 TO &NCONTLS;
+               DO __J=1 TO &NCA;
+                  SET __CASE POINT=__J;
+                  __SMALL=.;
+                  __MATCH=.;
+                  DO __K=1 TO &NCO;
+                     IF __USED(__K)='0' THEN DO;
+                        SET __CONT POINT=__K;
+                        __D=%DIJ
+                        IF __d^=. & (__SMALL=. | __D<__SMALL) %MAX1
+                        %if &time^= %then %do;
+                           & __cotime > __catime
+                        %end;
+                        THEN DO;
+                           __SMALL=__D;
+                           __MATCH=__K;
+                           __DIJ=__D;
+                           __CONT_N=__I;
+                        END;
+                     END;
+                  END;
+                  IF __MATCH^=. THEN DO;
+                     __USED(__MATCH)='1';
+                     OUTPUT;
+                  END;
+               END;
+            END;
+            STOP;
+         DATA &OUT;
+          SET __MATCH;
+          SET __CONT POINT=__MATCH;
+          KEEP __IDCA __IDCO __CONT_N __DIJ __CA1-__CA&NVAR
+               __CO1-__CO&NVAR __DIF1-__DIF&NVAR __WT1-__WT&NVAR
+               %if &time^= %then %do;
+                  __catime __cotime
+               %end;
+        ;
+          LABEL __IDCA="&IDCA/CASE"
+                __IDCO="&IDCO/CONTROL"
+                %if &time^= %then %do;
+                   __catime="&time/CASE"
+                   __cotime="&time/CONTROL"
+                %end;
+                __CONT_N='CONTROL/NUMBER'
+                __DIJ='DISTANCE/D_IJ'
+                %LBLS;
+             %DO I=1 %TO &NVAR;
+                __DIF&I=abs(__CA&I-__CO&I);
+                __WT&I=&&W&I;
+             %END;
+      %END;
+   %MEND GREEDY;
+   %MACRO OPTIMAL;
+    %GLOBAL BAD2;
+      DATA __CASE; SET &CASE;
+           %DO I=1 %TO &NVAR;
+                %LET MISSTEST=%SCAN(&MVARS,&I,' ');
+                IF &MISSTEST=. THEN DELETE;
+           %END;
+           %IF &TIME^= %THEN %DO;
+                IF &TIME=. THEN DELETE;
+           %END;
+      DATA __CASE; SET __CASE END=EOF;
+       KEEP __IDCA __CA1-__CA&NVAR &mvars
+         %if &time^= %then %do;
+            __catime
+         %end;
+         ;
+         __IDCA=&IDCA;
+         %if &time^= %then %do;
+            __catime=&time;
+         %end;
+         %DO I=1 %TO &NVAR;
+            __CA&I=&&V&I;
+         %END;
+         IF EOF THEN CALL SYMPUT('NCA',_N_);
+      DATA __CONT; SET &CONTROL;
+           %DO I=1 %TO &NVAR;
+                %LET MISSTEST=%SCAN(&MVARS,&I,' ');
+                IF &MISSTEST=. THEN DELETE;
+           %END;
+           %IF &TIME^= %THEN %DO;
+                IF &TIME=. THEN DELETE;
+           %END;
+      DATA __CONT; SET __CONT END=EOF;
+       KEEP __IDCO __CO1-__CO&NVAR &mvars
+         %if &time^= %then %do;
+            __cotime
+         %end;
+         ;
+         __IDCO=&IDCO;
+         %if &time^= %then %do;
+            __cotime=&time;
+         %end;
+         %DO I=1 %TO &NVAR;
+            __CO&I=&&V&I;
+         %END;
+         IF EOF THEN CALL SYMPUT('NCO',_N_);
+      RUN;
+      %LET BAD2=0;
+      %IF &NCO < %EVAL(&NCA*&NCONTLS) %THEN %DO;
+         %PUT ERROR: NOT ENOUGH CONTROLS TO MAKE REQUESTED MATCHES;
+         %LET BAD2=1;
+      %END;
+      %IF &BAD2=0 %THEN %DO;
+         DATA __DIST1;
+          SET __CASE;
+          LENGTH __FROM __TO $ 80;
+            DO I=1 TO &NCO;
+               SET __CONT POINT=I;
+               _COST_=%DIJ;
+               __FROM=left(__IDCA);
+               __TO=left(trim(__IDCO) || '_co');
+               _CAPAC_=1;
+               IF _COST_^=. THEN DO;
+                  %MAX2
+               END;
+            END;
+            DATA __GOODCO;
+             SET __DIST1;
+             KEEP __IDCO;
+            PROC SORT; BY __IDCO;
+            DATA __GOODCO;
+             SET __GOODCO; BY __IDCO;
+               IF FIRST.__IDCO;
+            data _null_;
+               i=1;
+               set __goodco point=i nobs=n;
+               call symput('newcont',n);
+               stop;
+            DATA __DIST2;
+             LENGTH __FROM __TO $ 80;
+               DO I=1 TO N;
+                  SET __GOODCO POINT=I NOBS=N;
+                  __FROM=left(trim(__IDCO) || '_co');
+                  __TO='SK';
+                  _COST_=0;
+                  _CAPAC_=1;
+                  OUTPUT;
+               END;
+            STOP;
+            DATA __GOODCA;
+             SET __DIST1;
+             KEEP __IDCA;
+            PROC SORT; BY __IDCA;
+            DATA __GOODCA;
+             SET __GOODCA; BY __IDCA;
+               IF FIRST.__IDCA;
+            DATA __DIST3;
+             LENGTH __FROM __TO $ 80;
+               DO I=1 TO N;
+                  SET __GOODCA POINT=I NOBS=N;
+                  __FROM='SC';
+                  __TO=left(__idca);
+                  _COST_=0;
+                  %if &mincont= %then %do;
+                     _CAPAC_=&NCONTLS;
+                  %end;
+                  %else %do;
+                     _capac_=&mincont;
+                  %end;
+                  OUTPUT;
+               END;
+               %if &mincont^= %then %do;
+                  __from='SC';
+                  __to='EXTRA';
+                  _capac_=&newcont-&mincont*n;
+                  _cost_=0;
+                  output;
+                  do i=1 to n;
+                     set __goodca point=i;
+                     __from='EXTRA';
+                     __to=left(__idca);
+                     _cost_=0;
+                     _capac_=&maxcont-&mincont;
+                     output;
+                  end;
+               %end;
+               CALL SYMPUT('NEWCASE',N);
+            STOP;
+            DATA __DIST;
+             SET __DIST1 __DIST2 __DIST3;
+         %LET DEM=%EVAL(&NEWCASE*&NCONTLS);
+         PROC NETFLOW
+            MAXIT1=&MAXITER
+            %if &mincont= %then %do;
+               DEMAND=&DEM
+            %end;
+            %else %do;
+               demand=&newcont
+            %end;
+            SOURCENODE='SC'
+            SINKNODE='SK'
+            ARCDATA=__DIST
+            ARCOUT=__MATCH;
+          TAIL __FROM;
+          HEAD __TO;
+         DATA __OUT;
+          SET __MATCH;
+            IF _FLOW_>0 & __FROM^in ('SC' 'EXTRA') & __TO^='SK';
+            __DIJ=_FCOST_;
+            %DO I=1 %TO &NVAR;
+               __DIF&I=abs(__CA&I-__CO&I);
+               __WT&I=&&W&I;
+            %END;
+         PROC SORT; BY __IDCA __DIJ;
+         DATA &OUT;
+          SET __OUT; BY __IDCA;
+            drop __from -- _status_;
+            IF FIRST.__IDCA THEN __CONT_N=0;
+            __CONT_N+1;
+          LABEL __IDCA="&IDCA/CASE"
+                __IDCO="&IDCO/CONTROL"
+                %if &time^= %then %do;
+                   __catime="&time/CASE"
+                   __cotime="&time/CONTROL"
+                %end;
+                __CONT_N='CONTROL/NUMBER'
+                __DIJ='DISTANCE/D_IJ'
+                %LBLS;
+      %END;
+   %MEND OPTIMAL;
+   %IF &BAD=0 %THEN %DO;
+      %IF %UPCASE(&METHOD)=GREEDY %THEN %DO;
+         %GREEDY
+      %END;
+      %ELSE %DO;
+         %OPTIMAL
+      %END;
+      %IF &BAD2=0 %THEN %DO;
+         PROC SORT DATA=&OUT; BY __IDCA __CONT_N;
+         proc sort data=__case; by __IDCA;
+         data &outnmca; merge __case
+              &out(in=__inout where=(__cont_n=1)); by __idca;
+              if __inout=0; **non-matches;
+
+         proc sort data=__cont; by __IDCO;
+         proc sort data=&out; by __IDCO;
+         data &outnmco; merge __cont
+              &out(in=__inout); by __idco;
+              if __inout=0; **non-matched controls;
+         proc sort data=&out; by __IDCA; **re-sort by case id;
+
+         %if %upcase(&print)=Y %then %do;
+         PROC PRINT data=&out LABEL SPLIT='/';
+          VAR __IDCA __IDCO __CONT_N
+          %if &time^= %then %do;
+             __catime __cotime
+          %end;
+          __DIJ %VBLES;
+          sum __dij;
+         title9'Data listing for matched cases and controls';
+         footnote
+    "match macro: case=&case control=&control idca=&idca idco=&idco";
+         footnote2
+"   mvars=&mvars  wts=&wts dmaxk=&dmaxk dmax=&dmax ncontls=&ncontls";
+         %if &time^= %then %do;
+  footnote3"time=&time  method=&method  seedca=&seedca  seedco=&seedco";
+         %end;
+         %else %do;
+           footnote3"   method=&method  seedca=&seedca  seedco=&seedco";
+         %end;
+         footnote4"   out=&out   outnmca=&outnmca  outnmco=&outnmco";
+         run;
+         title9'Summary data for matched cases and controls';
+         proc means data=&out n mean sum min max; class __cont_n;
+          var __dij
+           %if &nvar >=2 %then %do; __dif1-__dif&nvar  __ca1-__ca&nvar
+                             %if &time^= %then %do;
+                                __catime
+                             %end;
+                             __co1-__co&nvar
+                             %if &time^= %then %do;
+                                __cotime
+                             %end;
+                             ;
+           %end;
+           %else %do;
+                             __dif1 __ca1
+                             %if &time^= %then %do;
+                                __catime
+                             %end;
+                             __co1
+                             %if &time^= %then %do;
+                                __cotime
+                             %end;
+                             ;
+           %end;
+         run;
+         proc means data=&outnmca n mean sum min max; var &mvars;
+         title9'Summary data for NON-matched cases';
+         run;
+         proc means data=&outnmco n mean sum min max; var &mvars;
+         title9'Summary data for NON-matched controls';
+         run;
+         %end;
+      %END;
+   %END;
+    title9; footnote;
+    run;
+%MEND MATCH;
+
+/*calculate PS from your dataset - Aurum*/
+proc logistic descending data=udca_a.patient_tr_all;
+	class exp gender calendar trial
+cov1 cov2 cov3 cov4 cov5 cov7 cov8 cov9 cov10 cov11 cov12 cov13 cov14
+cov15 cov16 cov17 cov18 cov19 cov20 cov21 cov22 cov23 cov24 cov25 cov26 cov27 cov28 cov29
+cov30 cov31 cov32 cov33 cov34 cov35
+dcov1 dcov2 dcov3 dcov4 dcov5 dcov6 dcov7 dcov8 dcov9 dcov10 dcov11 dcov12 dcov13 dcov14
+dcov15 dcov16 dcov17 dcov18 dcov19 dcov20 dcov21;
+	model exp = age gender calendar  trial age*age 
+cov1 cov2 cov3 cov4 cov5 cov7 cov8 cov9 cov10 cov11 cov12 cov13 cov14
+cov15 cov16 cov17 cov18 cov19 cov20 cov21 cov22 cov23 cov24 cov25 cov26 cov27 cov28 cov29
+cov30 cov31 cov32 cov33 cov34 cov35
+dcov1 dcov2 dcov3 dcov4 dcov5 dcov6 dcov7 dcov8 dcov9 dcov10 dcov11 dcov12 dcov13 dcov14
+dcov15 dcov16 dcov17 dcov18 dcov19 dcov20 dcov21;
+	output out=udca_a.out_ps prob=ps xbeta=logit_ps;
+run;
+
+%macro seq_mtch_aurum;
+%let min=1;
+%let max=160;
+%do j=&min %to &max;
+
+data out_ps;
+set udca_a.out_ps;
+	if trial=&j.;
+run;
+
+/*data manipulation*/
+data case;
+set out_ps;
+	if exp=1 ;
+	keep patid ps;
+run;
+
+data case1;
+set case;
+	caseid=_n_;
+run;
+
+data control;
+set out_ps;
+	if exp=0 ;
+	keep patid ps;
+run;
+
+data control1;
+set control;
+	ctlid=_n_;
+run;
+
+%match(case=case1,control=control1,idca=caseid,idco=ctlid,
+              mvars=ps,maxiter=100000,
+              wts=1, dmaxk=0.05,out=mtch,ncontls=3, /*weight, caliper, matching ratio*/
+              method=greedy, seedco=123, seedca=321);
+
+
+/*data cleaning*/
+data mtchall;set mtch;run;
+
+data mtchcase;set mtchall;
+rename __IDCA=caseid;
+keep  __IDCA ;
+run;
+proc sort data=mtchall;by __IDCA;run;
+
+data mtchctl;set mtchall;
+rename __IDCO=ctlid;
+keep  __IDCO  ;
+run;
+proc sort data=mtchctl;by ctlid;run;
+
+proc sort data=case1;by caseid;run;
+proc sort data=mtchcase;by caseid;run;
+
+data mtchcase1;merge mtchcase(in=inmtchcase) case1;
+by caseid;
+if inmtchcase;
+keep patid ;run;
+
+proc sort data=mtchcase1;by patid;run;
+data mtchcase1f;set mtchcase1;
+by patid;
+if first.patid;
+group=1;
+run;
+
+proc sort data=control1;by ctlid;run;
+proc sort data=mtchctl;by ctlid;run;
+data mtchctl1;merge mtchctl(in=inmtchctl) control1;
+by ctlid;
+if inmtchctl;
+keep patid ;
+run;
+
+proc sort data=mtchctl1;by patid;run;
+data mtchctl1f;set mtchctl1;
+by patid;
+if first.patid;
+group=0;
+run;
+
+data mtchfinal;set mtchcase1f mtchctl1f;
+run;
+
+proc sql;
+create table psmtch_analysis_tr&j. as select * from out_ps where patid in (select patid from mtchfinal);
+quit;
+
+proc sql;
+    create table mtchID as
+    select distinct a.__IDCA,a.__IDCO,b.patid as patid_CA,c.patid as patid_CO
+    from mtchall as a
+    left join case1 as b 
+        on a.__IDCA = b.caseid
+	left join control1 as c 
+        on a.__IDCO = c.ctlid;
+quit;
+
+proc sql;
+    create table psmtch_analysis_tr&j. as
+    select distinct a.*,b.patid_CA as patid_mtch
+    from psmtch_analysis_tr&j. as a
+    left join mtchID as b 
+        on a.patid = b.patid_CO;
+quit;
+
+data udca_a.psmtch_analysis_tr&j.;
+set psmtch_analysis_tr&j.;
+	if patid_mtch="" then patid_mtch=patid;
+run;
+
+%end;
+%mend;
+
+%seq_mtch_aurum;
+
+/*calculate PS from your dataset - GOLD*/
+proc logistic descending data=udca_g.patient_tr_all;
+	class exp gender calendar trial
+cov1 cov2 cov3 cov4 cov5 cov7 cov8 cov9 cov10 cov11 cov12 cov13 cov14
+cov15 cov16 cov17 cov18 cov19 cov20 cov21 cov22 cov23 cov24 cov25 cov26 cov27 cov28 cov29
+cov30 cov31 cov32 cov33 cov34 cov35
+dcov1 dcov2 dcov3 dcov4 dcov5 dcov6 dcov7 dcov8 dcov9 dcov10 dcov11 dcov12 dcov13 dcov14
+dcov15 dcov16 dcov17 dcov18 dcov19 dcov20 dcov21;
+	model exp = age gender calendar  trial age*age 
+cov1 cov2 cov3 cov4 cov5 cov7 cov8 cov9 cov10 cov11 cov12 cov13 cov14
+cov15 cov16 cov17 cov18 cov19 cov20 cov21 cov22 cov23 cov24 cov25 cov26 cov27 cov28 cov29
+cov30 cov31 cov32 cov33 cov34 cov35
+dcov1 dcov2 dcov3 dcov4 dcov5 dcov6 dcov7 dcov8 dcov9 dcov10 dcov11 dcov12 dcov13 dcov14
+dcov15 dcov16 dcov17 dcov18 dcov19 dcov20 dcov21;
+	output out=udca_g.out_ps prob=ps xbeta=logit_ps;
+run;
+
+%macro seq_mtch_gold;
+%let min=1;
+%let max=160;
+%do j=&min %to &max;
+
+data out_ps;
+set udca_g.out_ps;
+	if trial=&j.;
+run;
+
+/*data manipulation*/
+data case;
+set out_ps;
+	if exp=1 ;
+	keep patid ps;
+run;
+
+data case1;
+set case;
+	caseid=_n_;
+run;
+
+data control;
+set out_ps;
+	if exp=0 ;
+	keep patid ps;
+run;
+
+data control1;
+set control;
+	ctlid=_n_;
+run;
+
+%match(case=case1,control=control1,idca=caseid,idco=ctlid,
+              mvars=ps,maxiter=100000,
+              wts=1, dmaxk=0.05,out=mtch,ncontls=3, /*weight, caliper, matching ratio*/
+              method=greedy, seedco=123, seedca=321);
+
+
+/*data cleaning*/
+data mtchall;set mtch;run;
+
+data mtchcase;set mtchall;
+rename __IDCA=caseid;
+keep  __IDCA ;
+run;
+proc sort data=mtchall;by __IDCA;run;
+
+data mtchctl;set mtchall;
+rename __IDCO=ctlid;
+keep  __IDCO  ;
+run;
+proc sort data=mtchctl;by ctlid;run;
+
+proc sort data=case1;by caseid;run;
+proc sort data=mtchcase;by caseid;run;
+
+data mtchcase1;merge mtchcase(in=inmtchcase) case1;
+by caseid;
+if inmtchcase;
+keep patid ;run;
+
+proc sort data=mtchcase1;by patid;run;
+data mtchcase1f;set mtchcase1;
+by patid;
+if first.patid;
+group=1;
+run;
+
+proc sort data=control1;by ctlid;run;
+proc sort data=mtchctl;by ctlid;run;
+data mtchctl1;merge mtchctl(in=inmtchctl) control1;
+by ctlid;
+if inmtchctl;
+keep patid ;
+run;
+
+proc sort data=mtchctl1;by patid;run;
+data mtchctl1f;set mtchctl1;
+by patid;
+if first.patid;
+group=0;
+run;
+
+data mtchfinal;set mtchcase1f mtchctl1f;
+run;
+
+proc sql;
+create table psmtch_analysis_tr&j. as select * from out_ps where patid in (select patid from mtchfinal);
+quit;
+
+proc sql;
+    create table mtchID as
+    select distinct a.__IDCA,a.__IDCO,b.patid as patid_CA,c.patid as patid_CO
+    from mtchall as a
+    left join case1 as b 
+        on a.__IDCA = b.caseid
+	left join control1 as c 
+        on a.__IDCO = c.ctlid;
+quit;
+
+proc sql;
+    create table psmtch_analysis_tr&j. as
+    select distinct a.*,b.patid_CA as patid_mtch
+    from psmtch_analysis_tr&j. as a
+    left join mtchID as b 
+        on a.patid = b.patid_CO;
+quit;
+
+data udca_g.psmtch_analysis_tr&j.;
+set psmtch_analysis_tr&j.;
+	if patid_mtch="" then patid_mtch=patid;
+run;
+
+%end;
+%mend;
+
+%seq_mtch_gold;
+
+%macro fixed_ratio_aurum;
+%let min=1;
+%let max=160;
+%do i=&min %to &max;
+
+data udca_a.psmtch_analysis_tr&i.;
+set udca_a.psmtch_analysis_tr&i.;
+	source="AURUM";
+run;
+proc sql;
+  create table psmtch_analysis_tr&i. as
+	select *, count(*) as n
+	from udca_a.psmtch_analysis_tr&i.
+	group by trial, patid_mtch;
+quit;
+data udca_a.psmtch_fixed_tr&i.;
+set psmtch_analysis_tr&i.;
+	if n=4;
+run;
+
+%end;
+%mend;
+
+%fixed_ratio_aurum;
+
+%macro fixed_ratio_gold;
+%let min=1;
+%let max=160;
+%do i=&min %to &max;
+
+data udca_g.psmtch_analysis_tr&i.;
+set udca_g.psmtch_analysis_tr&i.;
+	source="GOLD";
+run;
+proc sql;
+  create table psmtch_analysis_tr&i. as
+	select *, count(*) as n
+	from udca_g.psmtch_analysis_tr&i.
+	group by trial, patid_mtch;
+quit;
+data udca_g.psmtch_fixed_tr&i.;
+set psmtch_analysis_tr&i.;
+	if n=4;
+run;
+
+%end;
+%mend;
+
+%fixed_ratio_gold;
+
+%macro combine;
+%let min=1;
+%let max=160;
+%do i=&min %to &max;
+
+data udca.psmtch_fixed_tr&i.;
+set udca_g.psmtch_fixed_tr&i. udca_a.psmtch_fixed_tr&i.;
+run;
+
+%end;
+%mend;
+
+%combine;
+
+data udca.psmtch_analysis_fixed;
+set udca.psmtch_fixed_tr1-udca.psmtch_fixed_tr160;
+run;
+
+
+/* Histogram for follow-up time */
+proc format;
+  value exp_fmt  0 = 'No UDCA initiation'
+                 1 = 'UDCA initiation';
+run;
+data udca.psmtch_analysis_fixed;
+   set udca.psmtch_analysis_fixed;
+   followup_years = fu_parkin / 365.25;
+run;
+
+proc means data=udca.psmtch_analysis_fixed p25 p50 p75 p90 std mean;
+	var followup_years;
+	class exp;
+run;
+
+title "Histogram of follow-up time by treatment strategies";
+proc sgpanel data=udca.psmtch_analysis_fixed;
+  panelby EXP  / columns=2 onepanel novarname
+                 headerattrs=(weight=bold) ;  /* bold panel headers */
+  format EXP  exp_fmt.;
+  histogram followup_years /
+           binstart=0 binwidth=0.3              /* adjust as you like */
+           scale=count                          /* Frequency (counts) */
+           transparency=0.1;
+  colaxis label="Follow-up time (years)";
+  rowaxis label="Frequency (n)";
+run;
+title;
+
+%macro describe_trials_mtch;
+%do i = 1 %to 160;
+
+proc sql;
+    create table udca.Count_mtch_uniq_&i. as
+    select catx('_', 'group', exp) as Group, 
+           count(distinct patid) as UniqueIDCount,
+           sum(o_parkin) as NumParkin,  /* Count non-missing values of o_parkin */
+           mean(fu_parkin)/365.25 as AvgFuPark     /* Calculate average of fu_park */
+    from udca.psmtch_fixed_tr&i.
+    group by exp;
+quit;
+%end;
+%mend;
+%describe_trials_mtch;
+
+%macro merge_mtch;
+data udca.All_Counts_mtch;
+    length Table_Number $5;
+    retain Table_Number;
+    %do i = 1 %to 160;
+        set udca.Count_mtch_uniq_&i. (in=a);
+        if a then Table_Number = &i.;
+        output;
+    %end;
+run;
+%mend;
+%merge_mtch;
+
+proc sort data=udca.All_Counts_mtch;
+	by Table_Number;
+run;
+
+proc freq data=udca.psmtch_analysis_fixed;
+	tables exp*o_parksen exp*o_parkin exp*o_parkgp exp*o_parkall;
+run;
+
+data udca.psmtch_analysis_fixed;
+set udca.psmtch_analysis_fixed;
+	if o_parksen=1 then fu_parksen_lag=fu_parksen-1095;
+		else fu_parksen_lag=fu_parksen;
+	if o_parkin=1 then fu_parkin_lag=fu_parkin-1095;
+		else fu_parkin_lag=fu_parkin;
+	if o_parkgp=1 then fu_parkgp_lag=fu_parkgp-1095;
+		else fu_parkgp_lag=fu_parkgp;
+	if o_parkall=1 then fu_parkall_lag=fu_parkall-1095;
+		else fu_parkall_lag=fu_parkall;
+run;
+data psmtch_analysis_fixed;
+set udca.psmtch_analysis_fixed;
+	if fu_parkall_lag<=0 then delete;
+run;
+proc freq data=psmtch_analysis_fixed;
+	tables exp*o_parkall;
+run;
+
+proc sql;
+    create table udca.Count_mtch_uniq as
+    select catx('_', 'group', exp) as Group, 
+           count(distinct patid) as UniqueIDCount 
+    from udca.psmtch_analysis_fixed
+    group by exp
+    union all
+    select 'Total' as Group, 
+           count(distinct patid) as UniqueIDCount 
+    from udca.psmtch_analysis_fixed;
+quit;
+proc sql;
+    create table udca.Count_all_mtch as
+    select catx('_', 'group', exp) as Group, 
+           count(patid) as IDCount,
+           sum(o_parkin) as NumParkin,  /* Count non-missing values of o_parkin */
+           mean(fu_parkin)/365.25 as AvgFuPark     /* Calculate average of fu_park */
+    from udca.psmtch_analysis_fixed
+    group by exp;
+quit;
+
+%macro cum_dose_aurum;
+%let min=1;
+%let max=160;
+%do i=&min %to &max;
+
+data udca_a.psmtch_fixed_tr&i.;
+set udca_a.psmtch_fixed_tr&i.;
+	if dod~=. and dod<=enddate then o_death=1;
+		else o_death=0;
+		fu_death=enddate-indexdate;
+run;
+
+/*Long data format*/
+data udca_a.psmtch_fixed_tr&i.;
+set udca_a.psmtch_fixed_tr&i.;
+	surv_death=floor(fu_death/91.3125);
+	surv_parkin=floor(fu_parkin/91.3125)-1;
+	surv_parkall=floor(fu_parkall/91.3125)-1;
+	surv_parksen=floor(fu_parksen/91.3125)-1;
+	surv_parkgp=floor(fu_parkgp/91.3125)-1;
+run;
+
+* Expanding dataset;
+data udca_a.psmtch_surv_tr&i.;
+set udca_a.psmtch_fixed_tr&i.;
+	do loop= 0 to surv_death;
+		output;
+	end;
+run;
+
+* Creating variable for time;
+proc sort data=udca_a.psmtch_surv_tr&i.;
+	by patid;
+run;
+data udca_a.psmtch_surv_tr&i.;
+set udca_a.psmtch_surv_tr&i.;
+	retain t;
+	by patid;
+	if first.patid then t=0;
+	else t=t+1;
+run;
+
+* Creating event variable;
+data udca_a.psmtch_surv_tr&i.;
+set udca_a.psmtch_surv_tr&i.;
+	ev_death=(o_death=1 and t=surv_death);
+	ev_parkin=(o_parkin=1 and t=surv_parkin);
+	ev_parkall=(o_parkall=1 and t=surv_parkall);
+	ev_parksen=(o_parksen=1 and t=surv_parksen);
+	ev_parkgp=(o_parkgp=1 and t=surv_parkgp);
+run;
+proc sql;
+ 	create table UDCA_Rx_tr&i. as 
+	select distinct * from udca_a.UDCA_Rx
+	where patid in (select patid from udca_a.psmtch_analysis_tr&i.);
+quit;
+data indexdate_tr&i.;
+set udca_a.psmtch_fixed_tr&i.;
+	keep patid indexdate;
+run;
+proc sql;
+	create table UDCA_Rx_tr&i. as
+	select *
+	from UDCA_Rx_tr&i. as a
+	left join indexdate_tr&i. as b on a.patid=b.patid
+	where indexdate<=issuedate
+	order by patid,issuedate;
+quit;
+data UDCA_Rx_tr&i. (keep=patid t UDCA);
+set UDCA_Rx_tr&i.;
+	t=floor((issuedate-indexdate)/91.3125);
+	UDCA=1;
+run;
+proc sort data=UDCA_Rx_tr&i. nodupkey;
+	by patid t;
+run;
+proc sql;
+	create table udca_a.psmtch_cumdose_tr&i. as
+	select *
+	from udca_a.psmtch_surv_tr&i. as a
+	left join UDCA_Rx_tr&i. as b on a.patid=b.patid and a.t=b.t
+	order by patid,t;
+quit;
+data udca_a.psmtch_cumdose_tr&i.;
+set udca_a.psmtch_cumdose_tr&i.;
+	if UDCA=. then UDCA=0;
+run;
+data udca_a.psmtch_cumdose_tr&i.;
+set udca_a.psmtch_cumdose_tr&i.;
+	by patid;
+	retain cum_UDCA;
+	if first.patid then cum_UDCA = UDCA;
+	else cum_UDCA = cum_UDCA + UDCA;
+run;
+
+%end;
+%mend;
+
+%cum_dose_aurum;
+
+%macro cum_dose_gold;
+%let min=1;
+%let max=160;
+%do i=&min %to &max;
+
+data udca_g.psmtch_fixed_tr&i.;
+set udca_g.psmtch_fixed_tr&i.;
+	if dod~=. and dod<=enddate then o_death=1;
+		else o_death=0;
+		fu_death=enddate-indexdate;
+run;
+
+/*Long data format*/
+data udca_g.psmtch_fixed_tr&i.;
+set udca_g.psmtch_fixed_tr&i.;
+	surv_death=floor(fu_death/91.3125);
+	surv_parkin=floor(fu_parkin/91.3125)-1;
+	surv_parkall=floor(fu_parkall/91.3125)-1;
+	surv_parksen=floor(fu_parksen/91.3125)-1;
+	surv_parkgp=floor(fu_parkgp/91.3125)-1;
+run;
+
+* Expanding dataset;
+data udca_g.psmtch_surv_tr&i.;
+set udca_g.psmtch_fixed_tr&i.;
+	do loop= 0 to surv_death;
+		output;
+	end;
+run;
+
+* Creating variable for time;
+proc sort data=udca_g.psmtch_surv_tr&i.;
+	by patid;
+run;
+data udca_g.psmtch_surv_tr&i.;
+set udca_g.psmtch_surv_tr&i.;
+	retain t;
+	by patid;
+	if first.patid then t=0;
+	else t=t+1;
+run;
+
+* Creating event variable;
+data udca_g.psmtch_surv_tr&i.;
+set udca_g.psmtch_surv_tr&i.;
+	ev_death=(o_death=1 and t=surv_death);
+	ev_parkin=(o_parkin=1 and t=surv_parkin);
+	ev_parkall=(o_parkall=1 and t=surv_parkall);
+	ev_parksen=(o_parksen=1 and t=surv_parksen);
+	ev_parkgp=(o_parkgp=1 and t=surv_parkgp);
+run;
+proc sql;
+ 	create table UDCA_Rx_tr&i. as 
+	select distinct * from udca_g.UDCA_Rx
+	where patid in (select patid from udca_g.psmtch_analysis_tr&i.);
+quit;
+data indexdate_tr&i.;
+set udca_g.psmtch_fixed_tr&i.;
+	keep patid indexdate;
+run;
+proc sql;
+	create table UDCA_Rx_tr&i. as
+	select *
+	from UDCA_Rx_tr&i. as a
+	left join indexdate_tr&i. as b on a.patid=b.patid
+	where indexdate<=eventdate
+	order by patid,eventdate;
+quit;
+data UDCA_Rx_tr&i. (keep=patid t UDCA);
+set UDCA_Rx_tr&i.;
+	t=floor((eventdate-indexdate)/91.3125);
+	UDCA=1;
+run;
+proc sort data=UDCA_Rx_tr&i. nodupkey;
+	by patid t;
+run;
+proc sql;
+	create table udca_g.psmtch_cumdose_tr&i. as
+	select *
+	from udca_g.psmtch_surv_tr&i. as a
+	left join UDCA_Rx_tr&i. as b on a.patid=b.patid and a.t=b.t
+	order by patid,t;
+quit;
+data udca_g.psmtch_cumdose_tr&i.;
+set udca_g.psmtch_cumdose_tr&i.;
+	if UDCA=. then UDCA=0;
+run;
+data udca_g.psmtch_cumdose_tr&i.;
+set udca_g.psmtch_cumdose_tr&i.;
+	by patid;
+	retain cum_UDCA;
+	if first.patid then cum_UDCA = UDCA;
+	else cum_UDCA = cum_UDCA + UDCA;
+run;
+
+%end;
+%mend;
+
+%cum_dose_gold;
+
+%macro combine;
+%let min=1;
+%let max=160;
+%do i=&min %to &max;
+
+data udca.psmtch_fixed_tr&i.;
+set udca_g.psmtch_fixed_tr&i. udca_a.psmtch_fixed_tr&i.;
+run;
+
+%end;
+%mend;
+
+%combine;
+data udca.psmtch_analysis_fixed;
+set udca.psmtch_fixed_tr1-udca.psmtch_fixed_tr160;
+run;
+
+data udca.psmtch_analysis_fixed;
+set udca.psmtch_analysis_fixed;
+	if o_death=1 or o_parkall=1 then o_comp=1;
+	else o_comp=0;
+run;
+proc freq data=udca.psmtch_analysis_fixed;
+	tables exp*o_comp;
+run;
+
+data udca_a.psmtch_cumdose_all;
+set udca_a.psmtch_cumdose_tr1-udca_a.psmtch_cumdose_tr160;
+run;
+data udca_g.psmtch_cumdose_all;
+set udca_g.psmtch_cumdose_tr1-udca_g.psmtch_cumdose_tr160;
+run;
+data udca.psmtch_cumdose_all;
+set udca_g.psmtch_cumdose_all udca_a.psmtch_cumdose_all;
+run;
+proc sort data=udca.psmtch_cumdose_all;
+	by trial patid t;
+run;
+
+data udca.psmtch_cumdose_parksen; 
+set udca.psmtch_cumdose_all;
+	if t>surv_parksen then delete;
+run;
+data udca.psmtch_cumdose_parkall; 
+set udca.psmtch_cumdose_all;
+	if t>surv_parkall then delete;
+run;
+data udca.psmtch_cumdose_parkin; 
+set udca.psmtch_cumdose_all;
+	if t>surv_parkin then delete;
+run;
+data udca.psmtch_cumdose_parkgp; 
+set udca.psmtch_cumdose_all;
+	if t>surv_parkgp then delete;
+run;
+
+%MACRO ITT_model(in_data=, outcome=, absolute_risk=, interval=, out_data=);
+/*ITT model*/
+proc logistic data= &in_data. desc outmodel=outmod;
+	ods exclude ClassLevelInfo Type3 Association FitStatistics GlobalTests;
+	model &outcome. = exp|t|t;
+run;
+
+* Creating dataset to store results;
+data riskset ;
+	do t = 0 to 79 ;
+		exp = 0 ;
+		output ;
+		exp = 1;
+		output ;
+	end;	
+run;
+
+* assignment of estimated hazard to each person-month;
+proc logistic inmodel=outmod;
+	score data=riskset out=results  (keep = t exp exp P_1 rename =(P_1=hazard));
+run;
+proc sort data = results; 
+	by exp t; 
+run;
+
+* computation of survival for each person-month;
+data results ;
+set results ;
+	by exp ;
+	retain surv ;
+	if first.exp then surv = 1 ;
+	surv = surv * (1-hazard);
+	risk = 1 - surv;
+run;
+proc print data=results;
+	var exp t risk;
+run;
+
+* Creating separate datasets for strategy = 0 and strategy = 1;
+data results0 results1 ;
+set results ;
+	if exp = 0 then output results0 ;
+	if exp = 1 then output results1 ;
+	keep t risk;
+run;
+		
+* Merging datasets for strategy = 0 and strategy = 1;
+data merge1 ;
+merge results0 (rename = (risk = risk0)) results1 (rename = (risk = risk1));
+	by t;
+	rd = risk1 - risk0;
+	rr = risk1 / risk0;
+run;
+
+* Edit data frame to reflect that risks are estimated at the END of each interval;
+data zero;
+	t = 0;
+	risk0 = 0;
+	risk1 = 0;
+run;
+data plot; 
+set merge1; 
+	t = t+1; 
+run;
+data plot;
+merge plot zero;
+	by t;
+run;
+data plot;
+set plot;
+	month=t*3;
+run;
+data &out_data.; set plot; run;
+
+* Creating plot;
+proc sgplot data = plot;
+	step x = month y = risk0 /legendlabel='No UDCA initiation' lineattrs=(pattern=1 color=ROSE thickness=2pt);
+	step x = month y = risk1 /legendlabel='UDCA initiation' lineattrs=(pattern=1 color=STEEL thickness=2pt);
+	yaxis label = 'Cumulative Incidence'  values = (0 to &absolute_risk. by &interval.) labelattrs=(size=12 weight = bold) valueattrs=(size=12 weight = bold);
+	xaxis label = 'Months'  values = (0 to 180 by 36) labelattrs=(size=12 weight = bold) valueattrs=(size=12 weight = bold);
+	keylegend/noborder title=' ' valueattrs=(size=12 weight = bold);
+run;
+title;
+
+proc logistic data= &in_data. desc outmodel=outmod_hr;
+	ods exclude ClassLevelInfo Type3 Association FitStatistics GlobalTests;
+	model &outcome. = exp t|t;
+ 	estimate intercept 0 exp 1 / exp;	
+run;
+
+%mend;
+
+%MACRO AT_model(in_data=, outcome=, absolute_risk=, interval=, out_data=);
+/*Cumulative dose model*/
+proc logistic data= &in_data. desc outmodel=outmod;
+	ods exclude ClassLevelInfo Type3 Association FitStatistics GlobalTests;
+	model &outcome. = cum_UDCA|cum_UDCA|cum_UDCA|t|t;
+run;
+
+* Creating dataset to store results;
+data riskset ;
+	do t = 0 to 79 ;
+	exp = 0 ;
+		cum_UDCA = 0 ;
+		output ;
+		exp = 1;
+		cum_UDCA = t+1 ;
+		output ;
+	end;	
+run;
+
+* assignment of estimated hazard to each person-month;
+proc logistic inmodel=outmod;
+	score data=riskset out=results  (keep = t exp cum_UDCA P_1 rename =(P_1=hazard));
+run;
+proc sort data = results; 
+	by exp t; 
+run;
+
+* computation of survival for each person-month;
+data results ;
+set results ;
+	by exp ;
+	retain surv ;
+	if first.exp then surv = 1 ;
+	surv = surv * (1-hazard);
+	risk = 1 - surv;
+run;
+proc print data=results;
+	var exp cum_UDCA t risk;
+run;
+
+* Creating separate datasets for strategy = 0 and strategy = 1;
+data results0 results1 ;
+set results ;
+	if exp = 0 then output results0 ;
+	if exp = 1 then output results1 ;
+	keep t risk;
+run;
+		
+* Merging datasets for strategy = 0 and strategy = 1;
+data merge1 ;
+merge results0 (rename = (risk = risk0)) results1 (rename = (risk = risk1));
+	by t;
+	rd = risk1 - risk0;
+	rr = risk1 / risk0;
+run;
+
+* Edit data frame to reflect that risks are estimated at the END of each interval;
+data zero;
+	t = 0;
+	risk0 = 0;
+	risk1 = 0;
+run;
+data plot; 
+set merge1; 
+	t = t+1; 
+run;
+data plot;
+merge plot zero;
+	by t;
+run;
+data plot;
+set plot;
+	month=t*3;
+run;
+data &out_data.; set plot; run;
+
+* Creating plot;
+proc sgplot data = plot;
+	step x = month y = risk0 /legendlabel='Never treated by UDCA' lineattrs=(pattern=1 color=ROSE thickness=2pt);
+	step x = month y = risk1 /legendlabel='Always treated by UDCA' lineattrs=(pattern=1 color=STEEL thickness=2pt);
+	yaxis label = 'Cumulative Incidence'  values = (0 to &absolute_risk. by &interval.) labelattrs=(size=12 weight = bold) valueattrs=(size=12 weight = bold);
+	xaxis label = 'Months'  values = (0 to 180 by 36) labelattrs=(size=12 weight = bold) valueattrs=(size=12 weight = bold);
+	keylegend/noborder title=' ' valueattrs=(size=12 weight = bold);
+run;
+title;
+
+%mend;
+
+%ITT_model(in_data=udca.psmtch_cumdose_parkin, outcome=ev_parkin, absolute_risk=0.05, interval=0.01, out_data=udca.parkin_ITT);
+%ITT_model(in_data=udca.psmtch_cumdose_parkgp, outcome=ev_parkgp, absolute_risk=0.05, interval=0.01, out_data=udca.parkgp_ITT);
+%ITT_model(in_data=udca.psmtch_cumdose_parksen, outcome=ev_parksen, absolute_risk=0.05, interval=0.01, out_data=udca.parksen_ITT);
+%ITT_model(in_data=udca.psmtch_cumdose_parkall, outcome=ev_parkall, absolute_risk=0.05, interval=0.01, out_data=udca.parkall_ITT);
+
+%AT_model(in_data=udca.psmtch_cumdose_parkin, outcome=ev_parkin, absolute_risk=0.05, interval=0.01, out_data=udca.parkin_AT);
+%AT_model(in_data=udca.psmtch_cumdose_parkgp, outcome=ev_parkgp, absolute_risk=0.05, interval=0.01, out_data=udca.parkgp_AT);
+%AT_model(in_data=udca.psmtch_cumdose_parksen, outcome=ev_parksen, absolute_risk=0.05, interval=0.01, out_data=udca.parksen_AT);
+%AT_model(in_data=udca.psmtch_cumdose_parkall, outcome=ev_parkall, absolute_risk=0.05, interval=0.01, out_data=udca.parkall_AT);
+
+/*Event count and hazard ratio*/
+proc freq data=udca.psmtch_cumdose_all;
+	tables exp*udca;
+run;
+
+proc logistic data= udca.psmtch_cumdose_all desc outmodel=outmod_hr;
+	ods exclude ClassLevelInfo Type3 Association FitStatistics GlobalTests;
+	model ev_death = exp t|t;
+ 	estimate intercept 0 exp 1 / exp;	
+run;
+
+proc freq data=udca.psmtch_cumdose_parkin;
+	tables exp*ev_parkin;
+run;
+proc genmod descending data=udca.psmtch_cumdose_parkin;
+	class exp (ref="0") patid;
+	model ev_parkin = exp t t*t
+	/link=logit dist=bin; 
+	repeated subject=patid/type=ind;
+run;
+
+proc freq data=udca.psmtch_cumdose_parkgp;
+	tables exp*ev_parkgp;
+run;
+proc genmod descending data=udca.psmtch_cumdose_parkgp;
+	class exp (ref="0") patid;
+	model ev_parkgp = exp t t*t
+	/link=logit dist=bin; 
+	repeated subject=patid/type=ind;
+run;
+
+proc freq data=udca.psmtch_cumdose_parksen;
+	tables exp*ev_parksen;
+run;
+proc genmod descending data=udca.psmtch_cumdose_parksen;
+	class exp (ref="0") patid;
+	model ev_parksen = exp t t*t
+	/link=logit dist=bin; 
+	repeated subject=patid/type=ind;
+run;
+
+proc freq data=udca.psmtch_cumdose_parkall;
+	tables exp*ev_parkall;
+run;
+proc genmod descending data=udca.psmtch_cumdose_parkall;
+	class exp (ref="0") patid;
+	model ev_parkall = exp t t*t
+	/link=logit dist=bin; 
+	repeated subject=patid/type=ind;
+run;
+
+/*3-year lead*/
+data udca.psmtch_cumdose_parkin_lag;
+set udca.psmtch_cumdose_parkin;
+	if o_parkin=1 then surv_parkin_lag=surv_parkin-12;
+	else surv_parkin_lag=surv_parkin;
+run;
+data udca.psmtch_cumdose_parkin_lag;
+set udca.psmtch_cumdose_parkin_lag;
+	if surv_parkin_lag<0 then delete;
+	if t>surv_parkin_lag then delete;
+	if t=surv_parkin_lag then ev_parkin_lag=o_parkin;
+	else ev_parkin_lag=0;
+run;
+
+data udca.psmtch_cumdose_parkgp_lag;
+set udca.psmtch_cumdose_parkgp;
+	if o_parkgp=1 then surv_parkgp_lag=surv_parkgp-12;
+	else surv_parkgp_lag=surv_parkgp;
+run;
+data udca.psmtch_cumdose_parkgp_lag;
+set udca.psmtch_cumdose_parkgp_lag;
+	if surv_parkgp_lag<0 then delete;
+	if t>surv_parkgp_lag then delete;
+	if t=surv_parkgp_lag then ev_parkgp_lag=o_parkgp;
+	else ev_parkgp_lag=0;
+run;
+
+data udca.psmtch_cumdose_parksen_lag;
+set udca.psmtch_cumdose_parksen;
+	if o_parksen=1 then surv_parksen_lag=surv_parksen-12;
+	else surv_parksen_lag=surv_parksen;
+run;
+data udca.psmtch_cumdose_parksen_lag;
+set udca.psmtch_cumdose_parksen_lag;
+	if surv_parksen_lag<0 then delete;
+	if t>surv_parksen_lag then delete;
+	if t=surv_parksen_lag then ev_parksen_lag=o_parksen;
+	else ev_parksen_lag=0;
+run;
+
+data udca.psmtch_cumdose_parkall_lag;
+set udca.psmtch_cumdose_parkall;
+	if o_parkall=1 then surv_parkall_lag=surv_parkall-12;
+	else surv_parkall_lag=surv_parkall;
+run;
+data udca.psmtch_cumdose_parkall_lag;
+set udca.psmtch_cumdose_parkall_lag;
+	if surv_parkall_lag<0 then delete;
+	if t>surv_parkall_lag then delete;
+	if t=surv_parkall_lag then ev_parkall_lag=o_parkall;
+	else ev_parkall_lag=0;
+run;
+
+%ITT_model(in_data=udca.psmtch_cumdose_parkin_lag, outcome=ev_parkin_lag, absolute_risk=0.05, interval=0.01, out_data=udca.parkin_lag);
+%ITT_model(in_data=udca.psmtch_cumdose_parkgp_lag, outcome=ev_parkgp_lag, absolute_risk=0.05, interval=0.01, out_data=udca.parkgp_lag);
+%ITT_model(in_data=udca.psmtch_cumdose_parksen_lag, outcome=ev_parksen_lag, absolute_risk=0.05, interval=0.01, out_data=udca.parksen_lag);
+%ITT_model(in_data=udca.psmtch_cumdose_parkall_lag, outcome=ev_parkall_lag, absolute_risk=0.05, interval=0.01, out_data=udca.parkall_lag);
+
+proc genmod descending data=udca.psmtch_cumdose_parkin_lag;
+	class exp (ref="0") patid;
+	model ev_parkin_lag = exp t t*t
+	/link=logit dist=bin; 
+	repeated subject=patid/type=ind;
+run;
+proc genmod descending data=udca.psmtch_cumdose_parkgp_lag;
+	class exp (ref="0") patid;
+	model ev_parkgp_lag = exp t t*t
+	/link=logit dist=bin; 
+	repeated subject=patid/type=ind;
+run;
+proc genmod descending data=udca.psmtch_cumdose_parksen_lag;
+	class exp (ref="0") patid;
+	model ev_parksen_lag = exp t t*t
+	/link=logit dist=bin; 
+	repeated subject=patid/type=ind;
+run;
+proc genmod descending data=udca.psmtch_cumdose_parkall_lag;
+	class exp (ref="0") patid;
+	model ev_parkall_lag = exp t t*t
+	/link=logit dist=bin; 
+	repeated subject=patid/type=ind;
+run;
+
+/*Per protocol analysis*/
+%macro per_protocol_aurum;
+%let min=1;
+%let max=160;
+%do i=&min %to &max;
+data deviate0 deviate1;
+set udca_a.psmtch_cumdose_tr&i.;
+	if exp = 0 and UDCA=1 then output deviate0;
+	if exp = 1 and UDCA=0 then output deviate1;
+		keep patid_mtch t;
+run;
+data deviate;
+set deviate0 deviate1;
+run;
+proc sort data=deviate;
+	by patid_mtch t;
+run;
+data deviate;
+set deviate;
+	by patid_mtch;
+		if first.patid_mtch;
+		t_dev=t+2;
+run;
+data deviate;
+set deviate;
+	drop t;
+run;
+proc sql;
+	create table udca_a.psmtch_pp_tr&i. as
+	select *
+	from udca_a.psmtch_cumdose_tr&i. as a
+	left join deviate as b on a.patid_mtch=b.patid_mtch
+	order by patid,t;
+quit;
+data udca_a.psmtch_pp_tr&i.;
+set udca_a.psmtch_pp_tr&i.;
+	if t_dev~=. and t>t_dev then delete;
+run;
+
+%end;
+%mend;
+
+%per_protocol_aurum;
+
+%macro per_protocol_gold;
+%let min=1;
+%let max=160;
+%do i=&min %to &max;
+data deviate0 deviate1;
+set udca_g.psmtch_cumdose_tr&i.;
+	if exp = 0 and UDCA=1 then output deviate0;
+	if exp = 1 and UDCA=0 then output deviate1;
+		keep patid_mtch t;
+run;
+data deviate;
+set deviate0 deviate1;
+run;
+proc sort data=deviate;
+	by patid_mtch t;
+run;
+data deviate;
+set deviate;
+	by patid_mtch;
+		if first.patid_mtch;
+		t_dev=t+2;
+run;
+data deviate;
+set deviate;
+	drop t;
+run;
+proc sql;
+	create table udca_g.psmtch_pp_tr&i. as
+	select *
+	from udca_g.psmtch_cumdose_tr&i. as a
+	left join deviate as b on a.patid_mtch=b.patid_mtch
+	order by patid,t;
+quit;
+data udca_g.psmtch_pp_tr&i.;
+set udca_g.psmtch_pp_tr&i.;
+	if t_dev~=. and t>t_dev then delete;
+run;
+
+%end;
+%mend;
+
+%per_protocol_gold;
+
+data udca_a.psmtch_pp_all;
+set udca_a.psmtch_pp_tr1-udca_a.psmtch_pp_tr160;
+run;
+data udca_g.psmtch_pp_all;
+set udca_g.psmtch_pp_tr1-udca_g.psmtch_pp_tr160;
+run;
+data udca.psmtch_pp_all;
+set udca_g.psmtch_pp_all udca_a.psmtch_pp_all;
+run;
+
+data t_dev;
+set udca.psmtch_pp_all;
+	keep trial patid exp t_dev;
+run;
+data t_dev;
+set t_dev;
+	if t_dev=. then t_dev=79;
+run;
+proc sort data=t_dev nodupkey;
+	by trial patid;
+run;
+proc means data=t_dev mean std p25 p50 p75;
+	var t_dev;
+	class exp;
+run;
+
+data udca.psmtch_pp_parkin; 
+set udca.psmtch_pp_all;
+	if t>surv_parkin then delete;
+run;
+data udca.psmtch_pp_parkgp; 
+set udca.psmtch_pp_all;
+	if t>surv_parkgp then delete;
+run;
+
+%ITT_model(in_data=udca.psmtch_pp_parkgp, outcome=ev_parkgp, absolute_risk=0.05, interval=0.01, out_data=udca.parkgp_pp);
+
+/*Excluding cholangitis*/
+data psmtch_cumdose_parkin;
+set udca.psmtch_cumdose_parkin;
+	if dcov7=0 and dcov17=0;
+run;
+proc freq data=psmtch_cumdose_parkin;
+	tables exp*ev_parkin;
+run;
+data psmtch_cumdose_parkgp;
+set udca.psmtch_cumdose_parkgp;
+	if dcov7=0 and dcov17=0;
+run;
+proc freq data=psmtch_cumdose_parkgp;
+	tables exp*ev_parkgp;
+run;
+data psmtch_cumdose_parksen;
+set udca.psmtch_cumdose_parksen;
+	if dcov7=0 and dcov17=0;
+run;
+proc freq data=psmtch_cumdose_parksen;
+	tables exp*ev_parksen;
+run;
+data psmtch_cumdose_parkall;
+set udca.psmtch_cumdose_parkall;
+	if dcov7=0 and dcov17=0;
+run;
+proc freq data=psmtch_cumdose_parkall;
+	tables exp*ev_parkall;
+run;
+
+%ITT_model(in_data=psmtch_cumdose_parkin, outcome=ev_parkin, absolute_risk=0.05, interval=0.01, out_data=parkin_ITT);
+%ITT_model(in_data=psmtch_cumdose_parkgp, outcome=ev_parkgp, absolute_risk=0.05, interval=0.01, out_data=parkgp_ITT);
+%ITT_model(in_data=psmtch_cumdose_parksen, outcome=ev_parksen, absolute_risk=0.05, interval=0.01, out_data=parksen_ITT);
+%ITT_model(in_data=psmtch_cumdose_parkall, outcome=ev_parkall, absolute_risk=0.05, interval=0.01, out_data=parkall_ITT);
+
+/*Total effect*/
+data udca.psmtch_analysis_fixed;
+set udca.psmtch_analysis_fixed;
+	if o_death=1 then fu_total=completion-indexdate;
+		else fu_total=fu_death;
+run;
+data udca.psmtch_analysis_fixed;
+set udca.psmtch_analysis_fixed;
+	if o_parkin=0 then fu_parkin=fu_total;
+	if o_parkgp=0 then fu_parkgp=fu_total;
+	if o_parksen=0 then fu_parksen=fu_total;
+	if o_parkall=0 then fu_parkall=fu_total;
+run;
+
+*Long data format;
+data udca.psmtch_analysis_fixed;
+set udca.psmtch_analysis_fixed;
+	surv_total=floor(fu_total/91.3125);
+	surv_parkin=floor(fu_parkin/91.3125)-1;
+	surv_parkall=floor(fu_parkall/91.3125)-1;
+	surv_parksen=floor(fu_parksen/91.3125)-1;
+	surv_parkgp=floor(fu_parkgp/91.3125)-1;
+run;
+
+* Expanding dataset;
+data udca.psmtch_surv_total;
+set udca.psmtch_analysis_fixed;
+	do loop= 0 to surv_total;
+		output;
+	end;
+run;
+
+* Creating variable for time;
+proc sort data=udca.psmtch_surv_total;
+	by trial patid;
+run;
+* Creating event variable;
+data udca.psmtch_surv_total;
+set udca.psmtch_surv_total;
+	ev_parkin=(o_parkin=1 and loop=surv_parkin);
+	ev_parkall=(o_parkall=1 and loop=surv_parkall);
+	ev_parksen=(o_parksen=1 and loop=surv_parksen);
+	ev_parkgp=(o_parkgp=1 and loop=surv_parkgp);
+run;
+
+data udca.psmtch_surv_total;
+set udca.psmtch_surv_total;
+	rename loop=t;
+run;
+
+data udca.psmtch_surv_parkin; 
+set udca.psmtch_surv_total;
+	if t>surv_parkin then delete;
+run;
+data udca.psmtch_surv_parksen; 
+set udca.psmtch_surv_total;
+	if t>surv_parksen then delete;
+run;
+data udca.psmtch_surv_parkall; 
+set udca.psmtch_surv_total;
+	if t>surv_parkall then delete;
+run;
+data udca.psmtch_surv_parkgp; 
+set udca.psmtch_surv_total;
+	if t>surv_parkgp then delete;
+run;
+
+%ITT_model(in_data=udca.psmtch_surv_parkin, outcome=ev_parkin, absolute_risk=0.05, interval=0.01, out_data=udca.total_ITT);
+%ITT_model(in_data=udca.psmtch_surv_parkgp, outcome=ev_parkgp, absolute_risk=0.05, interval=0.01, out_data=udca.total_ITT);
+%ITT_model(in_data=udca.psmtch_surv_parksen, outcome=ev_parksen, absolute_risk=0.05, interval=0.01, out_data=udca.total_ITT);
+%ITT_model(in_data=udca.psmtch_surv_parkall, outcome=ev_parkall, absolute_risk=0.05, interval=0.01, out_data=udca.total_ITT);
+
+
+/*Composite of death and Parkinson's*/
+data udca.psmtch_cumdose_parkin; 
+set udca.psmtch_cumdose_parkin;
+	ev_death=(o_death=1 and t=(surv_death-1));
+	if ev_parkin=1 or ev_death=1 then ev_comp=1;
+	else ev_comp=0;
+run;
+proc freq data=udca.psmtch_cumdose_parkin; 
+	tables exp*ev_death;
+run;
+
+%ITT_model(in_data=udca.psmtch_cumdose_parkin, outcome=ev_comp, absolute_risk=0.50, interval=0.10, out_data=udca.comp_ITT);
+
+data udca.psmtch_cumdose_parkgp; 
+set udca.psmtch_cumdose_parkgp;
+	ev_death=(o_death=1 and t=(surv_death-1));
+	if ev_parkgp=1 or ev_death=1 then ev_comp=1;
+	else ev_comp=0;
+run;
+proc freq data=udca.psmtch_cumdose_parkgp; 
+	tables exp*ev_comp;
+run;
+
+%ITT_model(in_data=udca.psmtch_cumdose_parkgp, outcome=ev_comp, absolute_risk=0.50, interval=0.10, out_data=udca.comp_ITT);
+
+data udca.psmtch_cumdose_parksen; 
+set udca.psmtch_cumdose_parksen;
+	ev_death=(o_death=1 and t=(surv_death-1));
+	if ev_parksen=1 or ev_death=1 then ev_comp=1;
+	else ev_comp=0;
+run;
+proc freq data=udca.psmtch_cumdose_parksen; 
+	tables exp*ev_comp;
+run;
+
+%ITT_model(in_data=udca.psmtch_cumdose_parksen, outcome=ev_comp, absolute_risk=0.50, interval=0.10, out_data=udca.comp_ITT);
+
+data udca.psmtch_cumdose_parkall; 
+set udca.psmtch_cumdose_parkall;
+	ev_death=(o_death=1 and t=(surv_death-1));
+	if ev_parkall=1 or ev_death=1 then ev_comp=1;
+	else ev_comp=0;
+run;
+proc freq data=udca.psmtch_cumdose_parkall; 
+	tables exp*ev_comp;
+run;
+
+%ITT_model(in_data=udca.psmtch_cumdose_parkall, outcome=ev_comp, absolute_risk=0.50, interval=0.10, out_data=udca.comp_ITT);
+
+/*Age and sex subgroups*/
+data udca.psmtch_cumdose_parkall;
+set udca.psmtch_cumdose_parkall;
+	if age>=65 then age_group=1;
+	else age_group=0;
+run;
+data udca.psmtch_cumdose_parkall_sub1;
+set udca.psmtch_cumdose_parkall;
+	if age>=65;
+run;
+data udca.psmtch_cumdose_parkall_sub2;
+set udca.psmtch_cumdose_parkall;
+	if age<65;
+run;
+data udca.psmtch_cumdose_parkall_sub3;
+set udca.psmtch_cumdose_parkall;
+	if gender=1;
+run;
+data udca.psmtch_cumdose_parkall_sub4;
+set udca.psmtch_cumdose_parkall;
+	if gender=2;
+run;
+
+proc logistic data=udca.psmtch_cumdose_parkall desc;
+	ods exclude ClassLevelInfo Type3 Association FitStatistics GlobalTests;
+	class exp age_group gender;
+	model ev_parkin = exp t|t age_group exp*age_group;
+ 	estimate intercept 0 exp 1 / exp;	
+run;
+
+data psmtch_analysis_fixed;
+set udca.psmtch_analysis_fixed;
+	if gender=1;
+run;
+proc freq data=psmtch_analysis_fixed;
+	tables exp*o_parksen exp*o_parkin exp*o_parkgp exp*o_parkall;
+run;
+
+%ITT_model(in_data=udca.psmtch_cumdose_parkall_sub2, outcome=ev_parkall, absolute_risk=0.05, interval=0.01, out_data=parkall_ITT);
+%ITT_model(in_data=udca.psmtch_cumdose_parkall_sub1, outcome=ev_parkall, absolute_risk=0.05, interval=0.01, out_data=parkall_ITT);
+
+/*No reinitiators*/
+data psmtch_UDCA; 
+set udca.psmtch_analysis_fixed;
+	if exp=1;
+run;
+proc sort data=psmtch_UDCA nodupkey out=psmtch_UDCA_noreini;
+	by patid;
+run;
+proc sql;
+    create table reini as 
+    select a.*
+    from psmtch_UDCA as a
+    left join psmtch_UDCA_noreini as b
+    on a.patid = b.patid and a.trial = b.trial
+    where b.patid is null and b.trial is null;
+quit;
+data psmtch_noUDCA; 
+set udca.psmtch_analysis_fixed;
+	if exp=0;
+run;
+proc sql;
+    create table psmtch_noUDCA_noreini as 
+    select a.*
+    from psmtch_noUDCA as a
+    left join reini as b
+    on a.trial = b.trial and a.patid_mtch = b.patid_mtch
+    where b.trial is null and b.patid_mtch is null;
+quit;
+data udca.psmtch_analysis_noreini;
+set psmtch_noUDCA_noreini psmtch_UDCA_noreini;
+run;
+proc sort data=udca.psmtch_analysis_noreini;
+	by patid trial;
+run;
+proc freq data=udca.psmtch_analysis_noreini;
+	tables exp*o_parksen exp*o_parkin exp*o_parkgp exp*o_parkall;
+run;
+
+proc sql;
+    create table udca.psmtch_cumdose_noreini as 
+    select a.*
+    from udca.psmtch_cumdose_all as a
+    inner join udca.psmtch_analysis_noreini as b
+    on a.patid = b.patid and a.trial = b.trial;
+quit;
+
+data udca.psmtch_cumdose_noreini_parksen; 
+set udca.psmtch_cumdose_noreini;
+	if t>surv_parksen then delete;
+run;
+data udca.psmtch_cumdose_noreini_parkall; 
+set udca.psmtch_cumdose_noreini;
+	if t>surv_parkall then delete;
+run;
+data udca.psmtch_cumdose_noreini_parkin; 
+set udca.psmtch_cumdose_noreini;
+	if t>surv_parkin then delete;
+run;
+data udca.psmtch_cumdose_noreini_parkgp; 
+set udca.psmtch_cumdose_noreini;
+	if t>surv_parkgp then delete;
+run;
+
+%ITT_model(in_data=udca.psmtch_cumdose_noreini_parkin, outcome=ev_parkin, absolute_risk=0.05, interval=0.01, out_data=parkin_ITT);
+%ITT_model(in_data=udca.psmtch_cumdose_noreini_parkgp, outcome=ev_parkgp, absolute_risk=0.05, interval=0.01, out_data=parkgp_ITT);
+%ITT_model(in_data=udca.psmtch_cumdose_noreini_parksen, outcome=ev_parksen, absolute_risk=0.05, interval=0.01, out_data=parksen_ITT);
+%ITT_model(in_data=udca.psmtch_cumdose_noreini_parkall, outcome=ev_parkall, absolute_risk=0.05, interval=0.01, out_data=parkall_ITT);
+
+/*Negative control outcomes*/
+%macro trial_cov;
+%let min=1;
+%let max=160;
+%do k=&min %to &max;
+
+data indexdate;
+set udca_g.psmtch_fixed_tr&k.;
+	keep patid indexdate;
+run;
+
+proc sql; 
+	create table TN as
+	select distinct *
+	from indexdate as a
+	left join udca_g.cov_TN as b on a.patid=b.patid
+	order by patid,TNdate;
+quit;
+data TN;
+set TN;
+	if TNdate>indexdate;
+run;
+data TN;
+set TN;
+	by patid;
+		if first.patid;
+run;
+
+proc sql;
+    create table udca_g.psmtch_fixed_tr&k. as
+    select distinct *
+    from udca_g.psmtch_fixed_tr&k. as a
+    left join TN as b 
+        on a.patid = b.patid;
+quit;
+data udca_g.psmtch_fixed_tr&k.;
+set udca_g.psmtch_fixed_tr&k.;
+	if o_TN=. then o_TN=0;
+run;
+data udca_g.psmtch_fixed_tr&k.;
+set udca_g.psmtch_fixed_tr&k.;
+	if o_TN=1 then fu_TN=TNdate-indexdate;
+	else fu_TN=enddate-indexdate;
+run;
+
+%end;
+%mend;
+
+%trial_cov;
+
+%macro trial_cov;
+%let min=1;
+%let max=160;
+%do k=&min %to &max;
+
+data indexdate;
+set udca_a.psmtch_fixed_tr&k.;
+	keep patid indexdate;
+run;
+
+proc sql; 
+	create table TN as
+	select distinct *
+	from indexdate as a
+	left join udca_a.cov_TN as b on a.patid=b.patid
+	order by patid,TNdate;
+quit;
+data TN;
+set TN;
+	if TNdate>indexdate;
+run;
+data TN;
+set TN;
+	by patid;
+		if first.patid;
+run;
+
+proc sql;
+    create table udca_a.psmtch_fixed_tr&k. as
+    select distinct *
+    from udca_a.psmtch_fixed_tr&k. as a
+    left join TN as b 
+        on a.patid = b.patid;
+quit;
+data udca_a.psmtch_fixed_tr&k.;
+set udca_a.psmtch_fixed_tr&k.;
+	if o_TN=. then o_TN=0;
+run;
+data udca_a.psmtch_fixed_tr&k.;
+set udca_a.psmtch_fixed_tr&k.;
+	if o_TN=1 then fu_TN=TNdate-indexdate;
+	else fu_TN=enddate-indexdate;
+run;
+
+%end;
+%mend;
+
+%trial_cov;
+
+%macro combine;
+%let min=1;
+%let max=160;
+%do i=&min %to &max;
+
+data udca.psmtch_fixed_tr&i.;
+set udca_g.psmtch_fixed_tr&i. udca_a.psmtch_fixed_tr&i.;
+run;
+
+%end;
+%mend;
+
+%combine;
+
+data udca.psmtch_analysis_fixed;
+set udca.psmtch_fixed_tr1-udca.psmtch_fixed_tr160;
+run;
+
+proc freq data=udca.psmtch_analysis_fixed;
+	tables exp*o_TN;
+run;
+
+proc phreg data=udca.psmtch_analysis_fixed;
+    class exp (ref="0") patid;
+    model fu_TN*o_TN(0) = exp/rl;
+run;
+
+%macro trial_cov;
+%let min=1;
+%let max=160;
+%do k=&min %to &max;
+
+data indexdate;
+set udca_g.psmtch_fixed_tr&k.;
+	keep patid indexdate;
+run;
+
+proc sql; 
+	create table Cat as
+	select distinct *
+	from indexdate as a
+	left join udca_g.cov_Cat as b on a.patid=b.patid
+	order by patid,Catdate;
+quit;
+data Cat;
+set Cat;
+	if Catdate>indexdate;
+run;
+data Cat;
+set Cat;
+	by patid;
+		if first.patid;
+run;
+
+proc sql;
+    create table udca_g.psmtch_fixed_tr&k. as
+    select distinct *
+    from udca_g.psmtch_fixed_tr&k. as a
+    left join Cat as b 
+        on a.patid = b.patid;
+quit;
+data udca_g.psmtch_fixed_tr&k.;
+set udca_g.psmtch_fixed_tr&k.;
+	if o_Cat=. then o_Cat=0;
+run;
+data udca_g.psmtch_fixed_tr&k.;
+set udca_g.psmtch_fixed_tr&k.;
+	if o_Cat=1 then fu_Cat=Catdate-indexdate;
+	else fu_Cat=enddate-indexdate;
+run;
+
+%end;
+%mend;
+
+%trial_cov;
+
+%macro trial_cov;
+%let min=1;
+%let max=160;
+%do k=&min %to &max;
+
+data indexdate;
+set udca_a.psmtch_fixed_tr&k.;
+	keep patid indexdate;
+run;
+
+proc sql; 
+	create table Cat as
+	select distinct *
+	from indexdate as a
+	left join udca_a.cov_Cat as b on a.patid=b.patid
+	order by patid,Catdate;
+quit;
+data Cat;
+set Cat;
+	if Catdate>indexdate;
+run;
+data Cat;
+set Cat;
+	by patid;
+		if first.patid;
+run;
+
+proc sql;
+    create table udca_a.psmtch_fixed_tr&k. as
+    select distinct *
+    from udca_a.psmtch_fixed_tr&k. as a
+    left join Cat as b 
+        on a.patid = b.patid;
+quit;
+data udca_a.psmtch_fixed_tr&k.;
+set udca_a.psmtch_fixed_tr&k.;
+	if o_Cat=. then o_Cat=0;
+run;
+data udca_a.psmtch_fixed_tr&k.;
+set udca_a.psmtch_fixed_tr&k.;
+	if o_Cat=1 then fu_Cat=Catdate-indexdate;
+	else fu_Cat=enddate-indexdate;
+run;
+
+%end;
+%mend;
+
+%trial_cov;
+
+%macro combine;
+%let min=1;
+%let max=160;
+%do i=&min %to &max;
+
+data udca.psmtch_fixed_tr&i.;
+set udca_g.psmtch_fixed_tr&i. udca_a.psmtch_fixed_tr&i.;
+run;
+
+%end;
+%mend;
+
+%combine;
+
+data udca.psmtch_analysis_fixed;
+set udca.psmtch_fixed_tr1-udca.psmtch_fixed_tr160;
+run;
+
+proc freq data=udca.psmtch_analysis_fixed;
+	tables exp*o_Cat;
+run;
+
+proc phreg data=udca.psmtch_analysis_fixed;
+    class exp (ref="0") patid;
+    model fu_Cat*o_Cat(0) = exp/rl;
+run;
