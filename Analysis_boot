@@ -1,0 +1,537 @@
+/*ANALYTICAL CODES FOR BOOTSTRAPPED RESULTS AND CUMULATIVE INCIDENCE CURVES*/
+
+%MACRO ITT_model(in_data=, outcome=, out_data=);
+/*ITT model*/
+proc logistic data= &in_data. desc outmodel=outmod;
+	ods exclude ClassLevelInfo Type3 Association FitStatistics GlobalTests;
+	model &outcome. = exp|t|t;
+run;
+
+* Creating dataset to store results;
+data riskset ;
+	do t = 0 to 79 ;
+		exp = 0 ;
+		output ;
+		exp = 1;
+		output ;
+	end;	
+run;
+
+* assignment of estimated hazard to each person-month;
+proc logistic inmodel=outmod;
+	score data=riskset out=results  (keep = t exp exp P_1 rename =(P_1=hazard));
+run;
+proc sort data = results; 
+	by exp t; 
+run;
+
+* computation of survival for each person-month;
+data results ;
+set results ;
+	by exp ;
+	retain surv ;
+	if first.exp then surv = 1 ;
+	surv = surv * (1-hazard);
+	risk = 1 - surv;
+run;
+proc print data=results;
+	var exp t risk;
+run;
+
+* Creating separate datasets for strategy = 0 and strategy = 1;
+data results0 results1 ;
+set results ;
+	if exp = 0 then output results0 ;
+	if exp = 1 then output results1 ;
+	keep t risk;
+run;
+		
+* Merging datasets for strategy = 0 and strategy = 1;
+data merge1 ;
+merge results0 (rename = (risk = risk0)) results1 (rename = (risk = risk1));
+	by t;
+	rd = risk1 - risk0;
+	rr = risk1 / risk0;
+run;
+
+* Edit data frame to reflect that risks are estimated at the END of each interval;
+data zero;
+	t = 0;
+	risk0 = 0;
+	risk1 = 0;
+run;
+data plot; 
+set merge1; 
+	t = t+1; 
+run;
+data plot;
+merge plot zero;
+	by t;
+run;
+data plot;
+set plot;
+	month=t*3;
+run;
+data &out_data.; set plot; run;
+
+%mend;
+
+%MACRO AT_model(in_data=, outcome=, out_data=);
+/*Cumulative dose model*/
+proc logistic data= &in_data. desc outmodel=outmod;
+	ods exclude ClassLevelInfo Type3 Association FitStatistics GlobalTests;
+	model &outcome. = cum_UDCA|cum_UDCA|cum_UDCA|t|t;
+run;
+
+* Creating dataset to store results;
+data riskset ;
+	do t = 0 to 79 ;
+	exp = 0 ;
+		cum_UDCA = 0 ;
+		output ;
+		exp = 1;
+		cum_UDCA = t+1 ;
+		output ;
+	end;	
+run;
+
+* assignment of estimated hazard to each person-month;
+proc logistic inmodel=outmod;
+	score data=riskset out=results  (keep = t exp cum_UDCA P_1 rename =(P_1=hazard));
+run;
+proc sort data = results; 
+	by exp t; 
+run;
+
+* computation of survival for each person-month;
+data results ;
+set results ;
+	by exp ;
+	retain surv ;
+	if first.exp then surv = 1 ;
+	surv = surv * (1-hazard);
+	risk = 1 - surv;
+run;
+proc print data=results;
+	var exp cum_UDCA t risk;
+run;
+
+* Creating separate datasets for strategy = 0 and strategy = 1;
+data results0 results1 ;
+set results ;
+	if exp = 0 then output results0 ;
+	if exp = 1 then output results1 ;
+	keep t risk;
+run;
+		
+* Merging datasets for strategy = 0 and strategy = 1;
+data merge1 ;
+merge results0 (rename = (risk = risk0)) results1 (rename = (risk = risk1));
+	by t;
+	rd = risk1 - risk0;
+	rr = risk1 / risk0;
+run;
+
+* Edit data frame to reflect that risks are estimated at the END of each interval;
+data zero;
+	t = 0;
+	risk0 = 0;
+	risk1 = 0;
+run;
+data plot; 
+set merge1; 
+	t = t+1; 
+run;
+data plot;
+merge plot zero;
+	by t;
+run;
+data plot;
+set plot;
+	month=t*3;
+run;
+data &out_data.; set plot; run;
+
+%mend;
+
+proc sql; 
+	create table udca.psmtch_cumdose_n as 
+	select *, count (0) as n 
+	from udca.psmtch_cumdose_all 
+	group by patid_mtch;
+quit;
+
+options nosource nonotes;
+
+%macro replicate(indata= );
+
+%do i=1 %to 300;
+
+proc sort data=&indata.;
+	by trial patid_mtch exp t;
+run;
+proc surveyselect data=&indata. out=btspsample_&i. method=urs samprate=1 reps=1 outhits seed=&i.;
+	cluster patid_mtch;
+	id _ALL_;
+run;
+data btspsample_&i.;
+set btspsample_&i.;
+	if t=0 then newID+1;
+run;
+proc sort data=btspsample_&i.;
+	by trial newID t;
+run;
+
+data btspsample_&i._parkin; 
+set btspsample_&i.;
+	if t>surv_parkin then delete;
+run;
+data btspsample_&i._parkgp; 
+set btspsample_&i.;
+	if t>surv_parkgp then delete;
+run;
+data btspsample_&i._parksen; 
+set btspsample_&i.;
+	if t>surv_parksen then delete;
+run;
+data btspsample_&i._parkall; 
+set btspsample_&i.;
+	if t>surv_parkall then delete;
+run;
+
+data btspsample_&i._parkin_lag;
+set btspsample_&i._parkin;
+	if o_parkin=1 then surv_parkin_lag=surv_parkin-12;
+	else surv_parkin_lag=surv_parkin;
+run;
+data btspsample_&i._parkin_lag;
+set btspsample_&i._parkin_lag;
+	if surv_parkin_lag<0 then delete;
+	if t>surv_parkin_lag then delete;
+	if t=surv_parkin_lag then ev_parkin_lag=o_parkin;
+	else ev_parkin_lag=0;
+run;
+
+data btspsample_&i._parkgp_lag;
+set btspsample_&i._parkgp;
+	if o_parkgp=1 then surv_parkgp_lag=surv_parkgp-12;
+	else surv_parkgp_lag=surv_parkgp;
+run;
+data btspsample_&i._parkgp_lag;
+set btspsample_&i._parkgp_lag;
+	if surv_parkgp_lag<0 then delete;
+	if t>surv_parkgp_lag then delete;
+	if t=surv_parkgp_lag then ev_parkgp_lag=o_parkgp;
+	else ev_parkgp_lag=0;
+run;
+
+data btspsample_&i._parksen_lag;
+set btspsample_&i._parksen;
+	if o_parksen=1 then surv_parksen_lag=surv_parksen-12;
+	else surv_parksen_lag=surv_parksen;
+run;
+data btspsample_&i._parksen_lag;
+set btspsample_&i._parksen_lag;
+	if surv_parksen_lag<0 then delete;
+	if t>surv_parksen_lag then delete;
+	if t=surv_parksen_lag then ev_parksen_lag=o_parksen;
+	else ev_parksen_lag=0;
+run;
+
+data btspsample_&i._parkall_lag;
+set btspsample_&i._parkall;
+	if o_parkall=1 then surv_parkall_lag=surv_parkall-12;
+	else surv_parkall_lag=surv_parkall;
+run;
+data btspsample_&i._parkall_lag;
+set btspsample_&i._parkall_lag;
+	if surv_parkall_lag<0 then delete;
+	if t>surv_parkall_lag then delete;
+	if t=surv_parkall_lag then ev_parkall_lag=o_parkall;
+	else ev_parkall_lag=0;
+run;
+
+%ITT_model(in_data=btspsample_&i._parkin, outcome=ev_parkin, out_data=boot.parkin_ITT_&i.);
+%ITT_model(in_data=btspsample_&i._parkgp, outcome=ev_parkgp, out_data=boot.parkgp_ITT_&i.);
+%ITT_model(in_data=btspsample_&i._parksen, outcome=ev_parksen, out_data=boot.parksen_ITT_&i.);
+%ITT_model(in_data=btspsample_&i._parkall, outcome=ev_parkall, out_data=boot.parkall_ITT_&i.);
+
+%AT_model(in_data=btspsample_&i._parkin, outcome=ev_parkin, out_data=boot.parkin_AT_&i.);
+%AT_model(in_data=btspsample_&i._parkgp, outcome=ev_parkgp, out_data=boot.parkgp_AT_&i.);
+%AT_model(in_data=btspsample_&i._parksen, outcome=ev_parksen, out_data=boot.parksen_AT_&i.);
+%AT_model(in_data=btspsample_&i._parkall, outcome=ev_parkall, out_data=boot.parkall_AT_&i.);
+
+%ITT_model(in_data=btspsample_&i._parkin_lag, outcome=ev_parkin_lag, out_data=boot.parkin_lag_&i.);
+%ITT_model(in_data=btspsample_&i._parkgp_lag, outcome=ev_parkgp_lag, out_data=boot.parkgp_lag_&i.);
+%ITT_model(in_data=btspsample_&i._parksen_lag, outcome=ev_parksen_lag, out_data=boot.parksen_lag_&i.);
+%ITT_model(in_data=btspsample_&i._parkall_lag, outcome=ev_parkall_lag, out_data=boot.parkall_lag_&i.);
+
+proc delete data=btspsample_&i. btspsample_&i._parkin btspsample_&i._parksen btspsample_&i._parkgp btspsample_&i._parkall 
+btspsample_&i._parkin_lag btspsample_&i._parksen_lag btspsample_&i._parkgp_lag btspsample_&i._parkall_lag;
+run;
+
+%end;
+%mend;
+
+%replicate (indata=udca.psmtch_cumdose_n);
+
+options source notes;
+
+/*Bootstrapped results*/
+data boot.parksen_itt_all;
+set boot.parksen_itt_1-boot.parksen_itt_300;
+run;
+data boot.parksen_at_all;
+set boot.parksen_at_1-boot.parksen_at_300;
+run;
+data boot.parkgp_itt_all;
+set boot.parkgp_itt_1-boot.parkgp_itt_300;
+run;
+data boot.parkgp_at_all;
+set boot.parkgp_at_1-boot.parkgp_at_300;
+run;
+data boot.parkall_itt_all;
+set boot.parkall_itt_1-boot.parkall_itt_300;
+run;
+data boot.parkall_at_all;
+set boot.parkall_at_1-boot.parkall_at_300;
+run;
+data boot.parkin_itt_all;
+set boot.parkin_itt_1-boot.parkin_itt_300;
+run;
+data boot.parkin_at_all;
+set boot.parkin_at_1-boot.parkin_at_300;
+run;
+data boot.parksen_lag_all;
+set boot.parksen_lag_1-boot.parksen_lag_300;
+run;
+data boot.parkin_lag_all;
+set boot.parkin_lag_1-boot.parkin_lag_300;
+run;
+data boot.parkgp_lag_all;
+set boot.parkgp_lag_1-boot.parkgp_lag_300;
+run;
+data boot.parkall_lag_all;
+set boot.parkall_lag_1-boot.parkall_lag_300;
+run;
+
+%MACRO boot_plot(in_data=, in_data_boot=);
+
+%macro time_point(n=);
+
+%do i= 0 %to &n;
+
+data &in_data_boot._&i.;
+set &in_data_boot.;
+	if t=&i.;
+run;
+proc univariate data=&in_data_boot._&i. noprint;
+    var risk0 risk1 rr rd;
+    output out=percentiles_&i. pctlpts=2.5 97.5 pctlpre=risk0_p risk1_p rr_p rd_p;
+run;
+
+data percentiles_&i.;
+set percentiles_&i.;
+	t=&i.;
+run;
+
+%end;
+%mend;
+
+%time_point (n=80);
+
+data &in_data_boot._percentiles; 
+set percentiles_0-percentiles_80;
+run;
+
+proc sql;
+	create table &in_data_boot._plot as
+	select *
+	from &in_data. as a
+	left join &in_data_boot._percentiles as b on a.t=b.t
+	order by t;
+quit;
+
+%mend;
+
+%boot_plot(in_data=udca.parkin_ITT, in_data_boot=boot.parkin_ITT_all);
+%boot_plot(in_data=udca.parksen_ITT, in_data_boot=boot.parksen_ITT_all);
+%boot_plot(in_data=udca.parkgp_ITT, in_data_boot=boot.parkgp_ITT_all);
+%boot_plot(in_data=udca.parkall_ITT, in_data_boot=boot.parkall_ITT_all);
+
+%boot_plot(in_data=udca.parkin_AT, in_data_boot=boot.parkin_AT_all);
+%boot_plot(in_data=udca.parksen_AT, in_data_boot=boot.parksen_AT_all);
+%boot_plot(in_data=udca.parkgp_AT, in_data_boot=boot.parkgp_AT_all);
+%boot_plot(in_data=udca.parkall_AT, in_data_boot=boot.parkall_AT_all);
+
+%boot_plot(in_data=udca.parkin_lag, in_data_boot=boot.parkin_lag_all);
+%boot_plot(in_data=udca.parksen_lag, in_data_boot=boot.parksen_lag_all);
+%boot_plot(in_data=udca.parkgp_lag, in_data_boot=boot.parkgp_lag_all);
+%boot_plot(in_data=udca.parkall_lag, in_data_boot=boot.parkall_lag_all);
+
+
+%macro km_step(input=, time=, est=, lower=, upper=, out=);
+  proc sort data=&input out=_km_in; by &time; run;
+
+  data &out;
+    set _km_in;
+    by &time;
+    retain prev_time prev_est prev_low prev_up;
+    /* keep only complete rows */
+    if nmiss(&time, &est, &lower, &upper)=0;
+    if _n_=1 then do;
+      time     = &time;
+      estimate = &est;
+      lower    = &lower;
+      upper    = &upper;
+      output;
+      prev_time=time; prev_est=estimate; prev_low=lower; prev_up=upper;
+    end;
+    else do;
+      /* horizontal piece to the new time (repeat previous values at current time) */
+      time     = &time;
+      estimate = prev_est;
+      lower    = prev_low;
+      upper    = prev_up;
+      output;
+      /* vertical jump at the same time (new values) */
+      time     = &time;
+      estimate = &est;
+      lower    = &lower;
+      upper    = &upper;
+      output;
+      prev_time=time; prev_est=estimate; prev_low=lower; prev_up=upper;
+    end;
+    keep time estimate lower upper;
+  run;
+  proc datasets nolist; delete _km_in; quit;
+%mend;
+
+%km_step(input=boot.parkin_ITT_all_plot, time=month, est=risk0, lower=risk0_p2_5, upper=risk0_p97_5, out=step0);
+%km_step(input=boot.parkin_ITT_all_plot, time=month, est=risk1, lower=risk1_p2_5, upper=risk1_p97_5, out=step1);
+
+%km_step(input=boot.parkin_lag_all_plot, time=month, est=risk0, lower=risk0_p2_5, upper=risk0_p97_5, out=step0);
+%km_step(input=boot.parkin_lag_all_plot, time=month, est=risk1, lower=risk1_p2_5, upper=risk1_p97_5, out=step1);
+
+%km_step(input=boot.parkgp_ITT_all_plot, time=month, est=risk0, lower=risk0_p2_5, upper=risk0_p97_5, out=step0);
+%km_step(input=boot.parkgp_ITT_all_plot, time=month, est=risk1, lower=risk1_p2_5, upper=risk1_p97_5, out=step1);
+
+%km_step(input=boot.parkgp_lag_all_plot, time=month, est=risk0, lower=risk0_p2_5, upper=risk0_p97_5, out=step0);
+%km_step(input=boot.parkgp_lag_all_plot, time=month, est=risk1, lower=risk1_p2_5, upper=risk1_p97_5, out=step1);
+
+%km_step(input=boot.parksen_ITT_all_plot, time=month, est=risk0, lower=risk0_p2_5, upper=risk0_p97_5, out=step0);
+%km_step(input=boot.parksen_ITT_all_plot, time=month, est=risk1, lower=risk1_p2_5, upper=risk1_p97_5, out=step1);
+
+%km_step(input=boot.parksen_lag_all_plot, time=month, est=risk0, lower=risk0_p2_5, upper=risk0_p97_5, out=step0);
+%km_step(input=boot.parksen_lag_all_plot, time=month, est=risk1, lower=risk1_p2_5, upper=risk1_p97_5, out=step1);
+
+%km_step(input=boot.parkall_ITT_all_plot, time=month, est=risk0, lower=risk0_p2_5, upper=risk0_p97_5, out=step0);
+%km_step(input=boot.parkall_ITT_all_plot, time=month, est=risk1, lower=risk1_p2_5, upper=risk1_p97_5, out=step1);
+
+%km_step(input=boot.parkall_lag_all_plot, time=month, est=risk0, lower=risk0_p2_5, upper=risk0_p97_5, out=step0);
+%km_step(input=boot.parkall_lag_all_plot, time=month, est=risk1, lower=risk1_p2_5, upper=risk1_p97_5, out=step1);
+
+data step_all;
+  length group $20.;
+  set step0(in=a) step1(in=b);
+  if a then group = 'No UDCA initiation';
+  else if b then group = 'UDCA initiation';
+run;
+
+proc sgplot data=step_all;
+  /* lock colours for both band and step lines */
+  styleattrs datacolors=(STEEL ROSE) datacontrastcolors=(STEEL ROSE);
+  /* CI bands (stepped because the data are stepped) */
+  band x=time lower=lower upper=upper / group=group transparency=0.8;
+  /* Step-wise survival curves */
+  step x=time y=estimate / group=group lineattrs=(pattern=1 thickness=2) name='est';
+  yaxis label='Cumulative Incidence' values=(0 to 0.05 by 0.01)
+        labelattrs=(size=12 weight=bold) valueattrs=(size=12 weight=bold);
+  xaxis label='Months' values=(0 to 180 by 36)
+        labelattrs=(size=12 weight=bold) valueattrs=(size=12 weight=bold);
+
+  keylegend 'est' / noborder title=' ' valueattrs=(size=12 weight=bold);
+run;
+
+%km_step(input=boot.parkin_AT_all_plot, time=month, est=risk0, lower=risk0_p2_5, upper=risk0_p97_5, out=step0);
+%km_step(input=boot.parkin_AT_all_plot, time=month, est=risk1, lower=risk1_p2_5, upper=risk1_p97_5, out=step1);
+
+%km_step(input=boot.parkgp_AT_all_plot, time=month, est=risk0, lower=risk0_p2_5, upper=risk0_p97_5, out=step0);
+%km_step(input=boot.parkgp_AT_all_plot, time=month, est=risk1, lower=risk1_p2_5, upper=risk1_p97_5, out=step1);
+
+%km_step(input=boot.parksen_AT_all_plot, time=month, est=risk0, lower=risk0_p2_5, upper=risk0_p97_5, out=step0);
+%km_step(input=boot.parksen_AT_all_plot, time=month, est=risk1, lower=risk1_p2_5, upper=risk1_p97_5, out=step1);
+
+%km_step(input=boot.parkall_AT_all_plot, time=month, est=risk0, lower=risk0_p2_5, upper=risk0_p97_5, out=step0);
+%km_step(input=boot.parkall_AT_all_plot, time=month, est=risk1, lower=risk1_p2_5, upper=risk1_p97_5, out=step1);
+
+data step_all;
+  length group $22;
+  set step0(in=a) step1(in=b);
+  if a then group = 'Never treated by UDCA';
+  else if b then group = 'Always treated by UDCA';
+run;
+
+proc sgplot data=step_all;
+  /* lock colours for both band and step lines */
+  styleattrs datacolors=(STEEL ROSE) datacontrastcolors=(STEEL ROSE);
+  /* CI bands (stepped because the data are stepped) */
+  band x=time lower=lower upper=upper / group=group transparency=0.8;
+  /* Step-wise survival curves */
+  step x=time y=estimate / group=group lineattrs=(pattern=1 thickness=2) name='est';
+  yaxis label='Cumulative Incidence' values=(0 to 0.05 by 0.01)
+        labelattrs=(size=12 weight=bold) valueattrs=(size=12 weight=bold);
+  xaxis label='Months' values=(0 to 180 by 36)
+        labelattrs=(size=12 weight=bold) valueattrs=(size=12 weight=bold);
+
+  keylegend 'est' / noborder title=' ' valueattrs=(size=12 weight=bold);
+run;
+
+data boot.parkin_ITT_all_plot;
+set boot.parkin_ITT_all_plot;
+	value=0;
+run;
+
+proc sgplot data = boot.parkin_ITT_all_plot noautolegend;
+   step x = month y = rd_p2_5 /lineattrs=(pattern=2 color=black thickness=2pt);
+   step x = month y = rd_p97_5 /lineattrs=(pattern=2 color=black thickness=2pt);
+   step x = month y = RD /lineattrs=(pattern=1 color=black thickness=2pt);
+   step x = month y = Value /lineattrs=(pattern=1 color=GRAY thickness=1pt);
+   /*title 'Survival from IP weighted hazards model';*/
+   yaxis label = 'Risk difference'  values = (-0.015 to 0.015 by 0.005) labelattrs=(size=12 weight = bold) valueattrs=(size=12 weight = bold);
+   xaxis label = 'Months'  values = (0 to 180 by 36) labelattrs=(size=12 weight = bold) valueattrs=(size=12 weight = bold);
+run;
+title;
+
+data boot.parkin_AT_all_plot;
+set boot.parkin_AT_all_plot;
+	value=0;
+run;
+
+proc sgplot data = boot.parkin_AT_all_plot noautolegend;
+   step x = month y = rd_p2_5 /lineattrs=(pattern=2 color=black thickness=2pt);
+   step x = month y = rd_p97_5 /lineattrs=(pattern=2 color=black thickness=2pt);
+   step x = month y = RD /lineattrs=(pattern=1 color=black thickness=2pt);
+   step x = month y = Value /lineattrs=(pattern=1 color=GRAY thickness=1pt);
+   /*title 'Survival from IP weighted hazards model';*/
+   yaxis label = 'Risk difference'  values = (-0.015 to 0.015 by 0.005) labelattrs=(size=12 weight = bold) valueattrs=(size=12 weight = bold);
+   xaxis label = 'Months'  values = (0 to 180 by 36) labelattrs=(size=12 weight = bold) valueattrs=(size=12 weight = bold);
+run;
+title;
+
+data boot.parkin_LAG_all_plot;
+set boot.parkin_LAG_all_plot;
+	value=0;
+run;
+
+proc sgplot data = boot.parkin_LAG_all_plot noautolegend;
+   step x = month y = rd_p2_5 /lineattrs=(pattern=2 color=black thickness=2pt);
+   step x = month y = rd_p97_5 /lineattrs=(pattern=2 color=black thickness=2pt);
+   step x = month y = RD /lineattrs=(pattern=1 color=black thickness=2pt);
+   step x = month y = Value /lineattrs=(pattern=1 color=GRAY thickness=1pt);
+   /*title 'Survival from IP weighted hazards model';*/
+   yaxis label = 'Risk difference'  values = (-0.015 to 0.015 by 0.005) labelattrs=(size=12 weight = bold) valueattrs=(size=12 weight = bold);
+   xaxis label = 'Months'  values = (0 to 180 by 36) labelattrs=(size=12 weight = bold) valueattrs=(size=12 weight = bold);
+run;
+title;
+
